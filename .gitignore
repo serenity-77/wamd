@@ -1,3 +1,6 @@
 coba/
 *.pyc
 qr.png
+wamd.egg-info
+build
+dist
