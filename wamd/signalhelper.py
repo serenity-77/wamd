@@ -2,7 +2,7 @@
 A Wrapper around axolotl cipher that maybe use
 an async storage.
 
-Literally everything is copied from axolotl
+Literally everything is copied from python-axolotl
 """
 import random
 
