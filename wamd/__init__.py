@@ -11,3 +11,6 @@ Literally everything combined from:
 
 import txaio
 txaio.use_twisted()
+
+from twisted.internet.protocol import Factory
+Factory.noisy = False

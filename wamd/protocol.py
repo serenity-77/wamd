@@ -11,6 +11,7 @@ from twisted.protocols.tls import TLSMemoryBIOFactory
 from twisted.internet.task import LoopingCall
 from twisted.python.failure import Failure
 from twisted.python.reflect import qual
+from twisted.logger import Logger
 
 from autobahn.twisted.websocket import WebSocketClientProtocol, WebSocketClientFactory
 
@@ -44,7 +45,7 @@ from .coder import (
     splitJid, Node
 )
 
-from .utils import generateRandomNumber, toHex, _LoggerNoOp, inflate
+from .utils import generateRandomNumber, toHex, inflate
 from .handlers import createNodeHander
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
@@ -57,7 +58,7 @@ _VALID_EVENTS = ["open", "qr", "close", "inbox", "ack"]
 
 class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
-    logger = None # set your own logger instance
+    log = Logger() # set your own logger instance
 
     # noise protocol
     _noiseHandshakeState = None
@@ -105,8 +106,8 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         else:
             failure = None
 
-        print()
-        print("failure: %s, self.factory.authDeferred: %r" % (failure, self.factory.authDeferred, ))
+        # print()
+        # print("failure: %s, self.factory.authDeferred: %r" % (failure, self.factory.authDeferred, ))
         if failure is not None and self.factory.authDeferred is not None:
             self.factory.authFailure(failure)
         else:
@@ -128,12 +129,6 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                 excReason = ConnectionClosedError(reason="Unknown Failure: \n%s" % (str(failure)))
 
             self.fire("close", self, Failure(excReason))
-
-    @property
-    def log(self):
-        if self.logger is not None:
-            return self.logger
-        return _LoggerNoOp()
 
     def _authDone(self):
         return self.factory.authDeferred is None

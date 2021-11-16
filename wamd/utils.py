@@ -16,10 +16,6 @@ from .errors import InvalidMediaSignature
 
 _CRYPTO_BACKEND = default_backend()
 
-class _LoggerNoOp:
-    def __getattr__(self, name):
-        return lambda *args, **kwargs: None
-
 
 def generateRandomNumber(length=32):
     s = str(decodeInt(os.urandom(2), 2))

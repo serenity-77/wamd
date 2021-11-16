@@ -129,8 +129,6 @@ class MessageHandler(NodeHandler):
                     'to': node['from'],
                 }))
 
-        print("\n\nMessage Proto\n\n")
-        print(messageProto)
-        
+
         message = WhatsAppMessage.fromMessageProto(messageProto, node=node, isRead=isRead)
         conn.fire("inbox", conn, message)
