@@ -28,10 +28,6 @@ globalLogPublisher.addObserver(
 )
 
 
-class MyMultiDeviceClient(MultiDeviceWhatsAppClientProtocol):
-    pass
-
-
 def protocolFactory():
     # Do any initialization here, such as reading session file
     # to be supplied to the protocol/connection.
