@@ -10,9 +10,15 @@ Literally everything combined from:
 Installation:
 ```shell
  git clone git@github.com:harianjalundu77/wamd.git
- python3 setup.py install
+ python3 setup.py install --record install.txt
 ```
 
+Uninstall:
+```shell
+xargs rm -rf < install.txt
+```
+
+python3 set
 Run the example:
 ```shell
 python3 example.py
