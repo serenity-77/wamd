@@ -4,10 +4,9 @@ import pyqrcode
 from io import BytesIO
 
 from twisted.internet import reactor
-from twisted.internet.defer import inlineCallbacks, maybeDeferred
+from twisted.internet.defer import inlineCallbacks
 
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClientProtocol
-from wamd.messages import TextMessage, MediaMessage
 
 
 from twisted.logger import (
