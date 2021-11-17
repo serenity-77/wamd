@@ -178,7 +178,7 @@ class WhatsAppMessage:
             cls = UnknownMessage
 
         return cls(**attributes)
-        
+
     def __repr__(self):
         return "\n<%s Object at 0x%x %s>\n" % (self.__class__.__name__, id(self), self._attrs.__repr__())
 
@@ -199,6 +199,10 @@ class ExtendedTextMessage(WhatsAppMessage):
     pass
 
 
+class TemplateMessage(WhatsAppMessage):
+    pass
+
+
 class UnknownMessage(WhatsAppMessage):
     pass
 
@@ -214,7 +218,7 @@ _MESSAGE_TYPE_CLASS_MAPS = {
     'videoMessage': MediaMessage,
     'contactsArrayMessage': None,
     'liveLocationMessage': None,
-    'templateMessage': None,
+    'templateMessage': TemplateMessage,
     'stickerMessage': None,
     'groupInviteMessage': None,
     'buttonsMessage': None
