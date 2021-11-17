@@ -18,6 +18,7 @@ Installation:
 Or using venv:
 ```shell
 python3 -m venv venv
+source venv/bin/activate
 git clone git@github.com:harianjalundu77/wamd.git
 cd wamd
 pip install -r requirements.txt
