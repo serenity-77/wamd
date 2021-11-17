@@ -25,6 +25,22 @@ pip install -r requirements.txt
 python setup.py install --record install.txt
 ```
 
+if this error occured during installation:
+
+```shell
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/tmp/pip-build-a86ixoex/cryptography/setup.py", line 14, in <module>
+    from setuptools_rust import RustExtension
+ModuleNotFoundError: No module named 'setuptools_rust'
+```
+
+Update the pip:
+```shell
+pip install --upgrade pip
+```
+and re-run the installation
+
 Uninstall:
 ```shell
 xargs rm -rf < install.txt

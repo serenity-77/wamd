@@ -2,6 +2,7 @@ coba/
 *.pyc
 qr.png
 wamd.egg-info
+src/wamd.egg-info
 build
 dist
 install.txt
