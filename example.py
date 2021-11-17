@@ -5,7 +5,6 @@ from io import BytesIO
 
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks, maybeDeferred
-from twisted.internet.protocol import Factory
 
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClientProtocol
 from wamd.messages import TextMessage, MediaMessage
