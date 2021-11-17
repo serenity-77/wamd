@@ -10,7 +10,18 @@ Literally everything combined from:
 Installation:
 ```shell
  git clone git@github.com:harianjalundu77/wamd.git
+ cd wamd
+ pip3 install -r requirements.txt
  python3 setup.py install --record install.txt
+```
+
+Or using venv:
+```shell
+python3 -m venv venv
+git clone git@github.com:harianjalundu77/wamd.git
+cd wamd
+pip install -r requirements.txt
+python setup.py install --record install.txt
 ```
 
 Uninstall:
