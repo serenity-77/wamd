@@ -50,6 +50,7 @@ Example:
 ```shell
 import sys
 import pyqrcode
+import png # Guard for pyqrcode
 
 from io import BytesIO
 
@@ -129,4 +130,5 @@ connectToWhatsAppServer(
 )
 
 reactor.run()
+
 ```
