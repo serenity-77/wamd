@@ -1,6 +1,9 @@
 twisted
+PyOpenSSL
+service_identity
 autobahn
 dissononce
 consonance
 python-axolotl
 protobuf
+setuptools-rust

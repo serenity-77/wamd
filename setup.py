@@ -7,11 +7,14 @@ setup(
     packages=find_packages(),
     install_requires=[
         "twisted",
+        "PyOpenSSL",
+        "service_identity",
         "autobahn",
         "dissononce",
         "consonance",
         "python-axolotl",
-        "protobuf"
+        "protobuf",
+        "setuptools-rust"
     ],
     include_package_data=True
 )
