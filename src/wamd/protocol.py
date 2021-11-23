@@ -513,9 +513,11 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
     @inlineCallbacks
     def _processMediaMessageAndSend(self, message):
         if message['url'].startswith("http:") or message['url'].startswith("https:"):
-            # TODO
-            # Download from http
-            pass
+            self.log.debug("Downloading file from {url}", url=message['url'])
+            try:
+                fileContent = yield doHttpRequest(message['url'])
+            except:
+                raise SendMessageError("Failed to download media from %s\n%s" % (message['url'], Failure()))
         else:
             if not os.path.exists(message['url']):
                 raise FileNotFoundError("File %s not found" % (message['url']))
@@ -678,9 +680,6 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         meUser, meServer = self.deviceJid.split("@")
 
         messageProto = message.toProtobufMessage()
-
-        print("\n\nmessageProto:\n")
-        print(messageProto)
 
         deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
         deviceSentMessageProto.destinationJid = message['to']
