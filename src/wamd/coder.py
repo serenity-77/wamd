@@ -508,14 +508,16 @@ class Node:
                 return child
         return None
 
-    def getChilds(self, tag):
+    getChild = findChild
+
+    def findChilds(self, tag):
         results = []
         for child in self.children:
             if child.tag == tag:
                 results.append(child)
         return results
 
-    getChild = findChild
+    getChilds = findChilds
 
     def hasContent(self):
         return self.content is not Node or self.children is not None
@@ -601,6 +603,7 @@ def decodeInt(value, length):
         r |= (v[i] << (i * 8))
     return r
 
+
 def getNumValidKeys(obj):
 	return len(list(filter(lambda x: obj[x] is not None, list(obj.keys()))))
 
@@ -647,3 +650,9 @@ def _splitUserAgent(userAgent):
         return (userAgent, None)
 
     return (user, agent)
+
+
+def isJidSameUser(jid1, jid2):
+    jid1User, _, _, jid1Server = splitJid(jid1)
+    jid2User, _, _, jid2Server = splitJid(jid2)
+    return jid1User == jid2User

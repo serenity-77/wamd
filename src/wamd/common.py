@@ -5,17 +5,24 @@ from twisted.python.reflect import qual
 
 from axolotl.ecc import curve, djbec, eckeypair
 from axolotl.util.keyhelper import KeyHelper
+from axolotl.identitykey import IdentityKey
 from axolotl.identitykeypair import IdentityKeyPair
 from axolotl.state.signedprekeyrecord import SignedPreKeyRecord
 
 
+from .store.default import DefaultMemoryStore
+from .iface import IJsonSerializable
+
+
 _INITIAL_ATTRIBUTES = [
-    "signedIdentityKey",
+    "identityKey",
     "noiseKey",
     "signedPrekey",
     "registrationId",
     "advSecretKey",
-    "me"
+    "me",
+    "signalIdentity",
+    "signedDeviceIdentity"
 ]
 
 
@@ -25,10 +32,9 @@ class AuthState:
         self.__dict__['_authState'] = {}
 
         if store is None:
-            from .signalstore.default import DefaultMemoryStore
             store = DefaultMemoryStore()
             store.loadSignedPreKey = lambda keyId: self.signedPrekey
-            store.getIdentityKeyPair = lambda: self.signedIdentityKey
+            store.getIdentityKeyPair = lambda: self.identityKey
             store.getLocalRegistrationId = lambda: self.registrationId
 
         self.__dict__['store'] = store
@@ -37,13 +43,9 @@ class AuthState:
             self._initKeys()
 
     def _initKeys(self):
-        identityKeyPair = curve.Curve.generateKeyPair()
-        self.signedIdentityKey = IdentityKeyPair(
-            identityKeyPair.getPublicKey(),
-            identityKeyPair.getPrivateKey()
-        )
+        self.identityKey = KeyHelper.generateIdentityKeyPair()
         self.noiseKey = curve.Curve.generateKeyPair()
-        self.signedPrekey = KeyHelper.generateSignedPreKey(self.signedIdentityKey, 1)
+        self.signedPrekey = KeyHelper.generateSignedPreKey(self.identityKey, 1)
         self.registrationId = KeyHelper.generateRegistrationId()
         self.advSecretKey = os.urandom(32)
         self.nextPrekeyId = 1
@@ -86,9 +88,9 @@ class AuthState:
     def toJson(self):
         jsonDict = {}
 
-        jsonDict['signedIdentityKey'] = {
-            'private': base64.b64encode(self.signedIdentityKey.getPrivateKey().getPrivateKey()).decode(),
-            'public': base64.b64encode(self.signedIdentityKey.getPublicKey().getPublicKey()).decode()
+        jsonDict['identityKey'] = {
+            'private': base64.b64encode(self.identityKey.getPrivateKey().getPrivateKey()).decode(),
+            'public': base64.b64encode(self.identityKey.getPublicKey().getPublicKey().getPublicKey()).decode()
         }
 
         jsonDict['noiseKey'] = {
@@ -112,6 +114,30 @@ class AuthState:
         if self.has("me"):
             jsonDict['me'] = self.me
 
+        if self.has("signalIdentity"):
+            jsonDict['signalIdentity'] = {
+                'identifier': self.signalIdentity['identifier'],
+                'identifierKey': base64.b64encode(self.signalIdentity['identifierKey']).decode()
+            }
+
+        if self.has("signedDeviceIdentity"):
+            jsonDict['signedDeviceIdentity'] = {
+                'details': base64.b64encode(self.signedDeviceIdentity['details']).decode(),
+                'accountSignature': base64.b64encode(self.signedDeviceIdentity['accountSignature']).decode(),
+                'accountSignatureKey': base64.b64encode(self.signedDeviceIdentity['accountSignatureKey']).decode(),
+                'deviceSignature': base64.b64encode(self.signedDeviceIdentity['deviceSignature']).decode()
+            }
+
+        store = self.__dict__['store']
+
+        if IJsonSerializable.providedBy(store):
+            # TODO
+            # Async toJson
+            jsonDictStore = store.toJson()
+            if jsonDictStore:
+                jsonDict['store'] = {}
+                jsonDict['store'].update(jsonDictStore)
+
         for k, v in self._authState.items():
             if k not in _INITIAL_ATTRIBUTES:
                 jsonDict[k] = v
@@ -123,14 +149,13 @@ class AuthState:
         authState = cls(init=False)
 
         try:
-            signedIdentityKey = jsonDict.pop("signedIdentityKey")
+            identityKey = jsonDict.pop("identityKey")
         except KeyError:
             pass
         else:
-            authState.signedIdentityKey = IdentityKeyPair(
-                djbec.DjbECPublicKey(base64.b64decode(signedIdentityKey['public'])),
-                djbec.DjbECPrivateKey(base64.b64decode(signedIdentityKey['private'])))
-            authState.identityKeyPair = authState.signedIdentityKey
+            authState.identityKey = IdentityKeyPair(
+                IdentityKey(djbec.DjbECPublicKey(base64.b64decode(identityKey['public']))),
+                djbec.DjbECPrivateKey(base64.b64decode(identityKey['private'])))
 
         try:
             noiseKey = jsonDict.pop("noiseKey")
@@ -168,6 +193,38 @@ class AuthState:
             pass
         else:
             authState.advSecretKey = base64.b64decode(advSecretKey)
+
+        try:
+            signalIdentity = jsonDict.pop("signalIdentity")
+        except KeyError:
+            pass
+        else:
+            authState.signalIdentity = {
+                'identifier': signalIdentity['identifier'],
+                'identifierKey': base64.b64decode(signalIdentity['identifierKey'])
+            }
+
+        try:
+            signedDeviceIdentity = jsonDict.pop("signedDeviceIdentity")
+        except KeyError:
+            pass
+        else:
+            authState.signedDeviceIdentity = {
+                'details': base64.b64decode(signedDeviceIdentity['details']),
+                'accountSignature': base64.b64decode(signedDeviceIdentity['accountSignature']),
+                'accountSignatureKey': base64.b64decode(signedDeviceIdentity['accountSignatureKey']),
+                'deviceSignature': base64.b64decode(signedDeviceIdentity['deviceSignature'])
+            }
+
+        if IJsonSerializable.providedBy(authState.store):
+            try:
+                jsonDictStore = jsonDict.pop("store")
+            except KeyError:
+                pass
+            else:
+                # TODO
+                # Async populate
+                authState.store.populate(jsonDictStore)
 
         for k, v in jsonDict.items():
             setattr(authState, k, v)

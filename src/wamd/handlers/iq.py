@@ -1,5 +1,6 @@
 import base64
 
+from twisted.logger import Logger
 from axolotl.ecc import curve, djbec
 
 from wamd.coder import Node
@@ -11,6 +12,8 @@ from .base import NodeHandler
 
 
 class IqHandler(NodeHandler):
+
+    log = Logger()
 
     def handleNode(self, conn, node):
         if node['type'] == "set":
@@ -30,11 +33,13 @@ class IqHandler(NodeHandler):
             qrInfo = [
                 refNodes[0].content,
                 base64.b64encode(conn.authState.noiseKey.getPublicKey().getPublicKey()),
-                base64.b64encode(conn.authState.signedIdentityKey.getPublicKey().getPublicKey()),
+                base64.b64encode(conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
                 base64.b64encode(conn.authState.advSecretKey)
             ]
 
-            conn.fire("qr", qrInfo)
+            conn.fire("qr", qrInfo).addErrback(
+                lambda f: self.log.error("Handle QR Failure: {failure}", failure=f)
+            )
 
             conn.sendMessageNode(Node(
                 "iq", attributes={
@@ -64,7 +69,7 @@ class IqHandler(NodeHandler):
 
             signedDeviceIdentityMsg = b"\x06\x00" + \
                 signedDeviceIdentity.details + \
-                conn.authState.signedIdentityKey.getPublicKey().getPublicKey()
+                conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()
 
             if not curve.Curve.verifySignature(
                 djbec.DjbECPublicKey(signedDeviceIdentity.accountSignatureKey),
@@ -75,11 +80,11 @@ class IqHandler(NodeHandler):
 
             deviceMessage = b"\x06\x01" + \
                 signedDeviceIdentity.details + \
-                conn.authState.signedIdentityKey.getPublicKey().getPublicKey() + \
+                conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey() + \
                 signedDeviceIdentity.accountSignatureKey
 
             signedDeviceIdentity.deviceSignature = curve.Curve.calculateSignature(
-                conn.authState.signedIdentityKey.getPrivateKey(),
+                conn.authState.identityKey.getPrivateKey(),
                 deviceMessage
             )
 

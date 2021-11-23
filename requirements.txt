@@ -6,4 +6,6 @@ dissononce
 consonance
 python-axolotl
 protobuf
+python-magic
+pillow
 setuptools-rust

@@ -9,4 +9,4 @@ class FailureHandler(NodeHandler):
         if not conn._authDone():
             conn._handleFailure(Failure(
                 AuthenticationFailedError(
-                    "Authentication Failed: %s" % (attrs['reason']))))
+                    "Authentication Failed: %s" % (node['reason']))))

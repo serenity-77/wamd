@@ -7,8 +7,7 @@ from twisted.python.reflect import qual
 
 from .proto import WAMessage_pb2
 from wamd.coder import Node
-from wamd.utils import protoMessageToJson
-
+from wamd.utils import protoMessageToJson, mediaTypeFromMime, jsonToProtoMessage
 
 
 class WhatsAppMessage:
@@ -82,14 +81,15 @@ class WhatsAppMessage:
 
         elif isinstance(self, MediaMessage):
             o += "%sMediaType: %s\n" % (indent, self['mediaType'])
+            o += "%sMime: %s\n" % (indent, self['mimetype'])
             if self['url'] is not None:
                 o += "%sUrl: %s\n" % (indent, self['url'])
             else:
                 o += "%sDirectPath: %s\n" % (indent, self['directPath'])
-            if self['caption'] is not None:
+            if self['caption'] is not None and self['mediaType'] in ["image", "video"]:
                 o += "%sCaption: %s\n" % (indent, self['caption'][:self.__class__._TEXT_LIMIT] + "..." if len(self['caption']) > self.__class__._TEXT_LIMIT else self['caption'])
             if self['fileName'] is not None:
-                o += "%sFileName: %s\n" % (indent, self['filename'])
+                o += "%sFileName: %s\n" % (indent, self['fileName'])
             if self['title'] is not None:
                 o += "%sTitle: %s\n" % (indent, self['title'])
 
@@ -165,9 +165,11 @@ class WhatsAppMessage:
                         if klass is not None:
                             messageDict = protoMessageToJson(getattr(webMessageInfoProto.message, messageType))
                             attributes.update(messageDict)
+                            if messageType in _SUPPORTED_MEDIA_KEYS:
+                                attributes['mediaType'] = mediaTypeFromMime(messageDict['mimetype'])
                             cls = klass
                         else:
-                            raise NotImplementedError("Message Type %s Not Implemented" % (messageType, ))
+                            raise NotImplementedError("Message Type [%s] Not Implemented" % (messageType, ))
 
         else:
             del attributes['isRead']
@@ -193,7 +195,33 @@ class TextMessage(WhatsAppMessage):
 
 
 class MediaMessage(WhatsAppMessage):
+
+    def toProtobufMessage(self):
+        mediaType = self['mediaType']
+
+        if mediaType == "image":
+            protoFactory = WAMessage_pb2.ImageMessage
+            messageProtoKey = "imageMessage"
+        elif mediaType == "document":
+            protoFactory = WAMessage_pb2.DocumentMessage
+            messageProtoKey = "documentMessage"
+        elif mediaType == "video":
+            protoFactory = WAMessage_pb2.VideoMessage
+            messageProtoKey = "videoMessage"
+        elif mediaType == "audio":
+            protoFactory = WAMessage_pb2.AudioMessage
+            messageProtoKey = "audioMessage"
+
+        mediaProto = jsonToProtoMessage(self._attrs, protoFactory)
+        messageProto = WAMessage_pb2.Message()
+        getattr(messageProto, messageProtoKey).MergeFrom(mediaProto)
+
+        return messageProto
+
+
+class StickerMessage(MediaMessage):
     pass
+
 
 class ExtendedTextMessage(WhatsAppMessage):
     pass
@@ -219,9 +247,10 @@ _MESSAGE_TYPE_CLASS_MAPS = {
     'contactsArrayMessage': None,
     'liveLocationMessage': None,
     'templateMessage': TemplateMessage,
-    'stickerMessage': None,
+    'stickerMessage': StickerMessage,
     'groupInviteMessage': None,
-    'buttonsMessage': None
+    'buttonsMessage': None,
+    'templateButtonReplyMessage': None
 }
 
 _SUPPORTED_MEDIA_KEYS = [

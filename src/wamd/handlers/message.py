@@ -1,11 +1,15 @@
 from twisted.internet.defer import inlineCallbacks
 from twisted.python.failure import Failure
 
+from axolotl.invalidkeyidexception import InvalidKeyIdException
+from axolotl.invalidmessageexception import InvalidMessageException
+from axolotl.duplicatemessagexception import DuplicateMessageException
+
 from .base import NodeHandler
-from wamd.coder import splitJid, Node
+from wamd.coder import splitJid, Node, isJidSameUser
 from wamd.signalhelper import decrypt as signalDecrypt
 from wamd.proto import WAMessage_pb2
-from wamd.utils import toHex, inflate
+from wamd.utils import toHex, inflate, removeRandomPadding
 from wamd.http import downloadMediaAndDecrypt
 from wamd.messages import WhatsAppMessage
 
@@ -37,32 +41,46 @@ class MessageHandler(NodeHandler):
         encNode = node.findChild("enc")
         user, _, _, server = splitJid(node['from'])
 
-        try:
-            plainText = yield signalDecrypt(
-                conn.authState,
-                encNode.content,
-                user,
-                type=encNode['type'],
-                unpad=encNode['v'] == "2")
-        except:
-            # TODO
-            # If exception is InvalidKeyIdException, maybe request a retry
-            self.log.error("Decrypt Failed {failure}", failure=Failure())
+        if encNode is None:
+            # Unavailable content
             return
 
-        self.log.debug("Decrypted PlainText: {plainText}", plainText=toHex(plainText))
-
-        messageProto = WAMessage_pb2.Message()
-        messageProto.ParseFromString(plainText)
-
-        if messageProto.HasField("protocolMessage"):
-            self._handleProtocolMessage(conn, node, messageProto.protocolMessage)
+        try:
+            plainText = yield signalDecrypt(
+                conn.authState.store,
+                encNode.content,
+                user,
+                type=encNode['type'])
+        except (InvalidKeyIdException, InvalidMessageException) as ex:
+            self.log.warn("Incoming Message [{messageId}] Decrypt Failed, message={message}, Going to send retry request",
+                messageId=node['id'], message=str(ex))
+            # TODO
+            # send receipt
+            # If exception is InvalidKeyIdException, maybe request a retry
+        except DuplicateMessageException:
+            # From Yowsup
+            self.log.warn("Received a message that we've previously decrypted")
+        except:
+            self.log.error("Decrypt Failure {failure}", failure=Failure())
         else:
-            self._handleIncomingMessage(conn, messageProto, node=node)
+            if encNode['v'] == "2":
+                plainText = removeRandomPadding(plainText)
+
+            self.log.debug("Decrypted PlainText: {plainText}", plainText=toHex(plainText))
+
+            messageProto = WAMessage_pb2.Message()
+            messageProto.ParseFromString(plainText)
+
+            if messageProto.HasField("protocolMessage"):
+                self._handleProtocolMessage(conn, node, messageProto.protocolMessage)
+            else:
+                self._sendReceipt(conn, node)
+                self._handleIncomingMessage(conn, messageProto, node=node)
 
 
     def _handleProtocolMessage(self, conn, node, protocolMessage):
         if protocolMessage.type == WAMessage_pb2.ProtocolMessage.HISTORY_SYNC_NOTIFICATION:
+            self._sendReceipt(conn, node)
             historySyncNotification = protocolMessage.historySyncNotification
             self._handleHistorySyncNotification(conn, node, historySyncNotification)
 
@@ -94,13 +112,6 @@ class MessageHandler(NodeHandler):
                             isRead = False
                         self._handleIncomingMessage(conn, webMessageInfoProto, isRead=isRead)
 
-        conn.sendMessageNode(Node(
-            "receipt", {
-                'id': node['id'],
-                'to': conn.getSelfJid(),
-                'type': "peer_msg"
-            }))
-
     def _handleIncomingMessage(self, conn, messageProto, node=None, isRead=False):
         if (
             not isinstance(messageProto, WAMessage_pb2.WebMessageInfo) and
@@ -113,6 +124,22 @@ class MessageHandler(NodeHandler):
             messageProto = m
             node['fromMe'] = True
 
+        try:
+            message = WhatsAppMessage.fromMessageProto(messageProto, node=node, isRead=isRead)
+        except:
+            self.log.failure("Failed to parse from protocol message")
+        else:
+            conn.fire("inbox", conn, message)
+
+    def _sendReceipt(self, conn, node):
+        if node['category'] is not None and node['category'] == "peer":
+            conn.sendMessageNode(Node(
+                "receipt", {
+                    'id': node['id'],
+                    'to': node['from'],
+                    'type': "peer_msg"
+                }))
+        elif isJidSameUser(node['from'], conn.authState.me['jid']):
             conn.sendMessageNode(Node(
                 "receipt", {
                     'id': node['id'],
@@ -120,15 +147,9 @@ class MessageHandler(NodeHandler):
                     'recipient': node['recipient'],
                     'type': "sender"
                 }))
-
-        elif not isinstance(messageProto, WAMessage_pb2.WebMessageInfo):
-            # message sent from another device
+        else:
             conn.sendMessageNode(Node(
                 "receipt", {
                     'id': node['id'],
                     'to': node['from'],
                 }))
-
-
-        message = WhatsAppMessage.fromMessageProto(messageProto, node=node, isRead=isRead)
-        conn.fire("inbox", conn, message)

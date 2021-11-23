@@ -4,7 +4,6 @@ an async storage.
 
 Literally everything is copied from python-axolotl
 """
-import random
 
 from twisted.internet.defer import maybeDeferred, inlineCallbacks
 from twisted.python.reflect import qual
@@ -22,41 +21,31 @@ from axolotl.duplicatemessagexception import DuplicateMessageException
 from axolotl.invalidkeyexception import InvalidKeyException
 from axolotl.nosessionexception import NoSessionException
 from axolotl.ecc.curve import Curve
-
-from .coder import decodeInt
-
-_MEDIUM_MAX_VALUE = 0xFFFFFF
+from axolotl.util.medium import Medium
 
 
 @inlineCallbacks
-def decrypt(authState, cipherText, recipientId, deviceId=1, type="pkmsg", unpad=True):
+def decrypt(signalStore, cipherText, recipientId, deviceId=1, type="pkmsg"):
     if type == "pkmsg":
         plainText = yield _decryptPkMsg(
-            authState, PreKeyWhisperMessage(serialized=cipherText),
+            signalStore, PreKeyWhisperMessage(serialized=cipherText),
             recipientId, deviceId)
 
     elif type == "msg":
         plainText = yield _decryptMsg(
-            authState, WhisperMessage(serialized=cipherText),
+            signalStore, WhisperMessage(serialized=cipherText),
             recipientId, deviceId)
 
     else:
         raise NotImplementedError("Type: %s not implemented" % (type, ))
 
-    if unpad:
-        unpadLength = decodeInt(plainText[-1:], 1) & 0xFF
-        plainText = plainText[:-unpadLength]
-
     return plainText
 
 
 @inlineCallbacks
-def encrypt(authState, plainText, recipientId, deviceId=1):
-    padNum = random.randint(1, 255)
-    paddedMessage = plainText + bytes([padNum] * padNum)
-
+def encrypt(signalStore, paddedMessage, recipientId, deviceId=1):
     sessionRecord = yield maybeDeferred(
-        authState.store.loadSession, recipientId, deviceId)
+        signalStore.loadSession, recipientId, deviceId)
 
     sessionState = sessionRecord.getSessionState()
     chainKey = sessionState.getSenderChainKey()
@@ -84,7 +73,7 @@ def encrypt(authState, plainText, recipientId, deviceId=1):
     sessionState.setSenderChainKey(chainKey.getNextChainKey())
 
     yield maybeDeferred(
-        authState.store.storeSession, recipientId, deviceId, sessionRecord)
+        signalStore.storeSession, recipientId, deviceId, sessionRecord)
 
     if isinstance(ciphertextMessage, PreKeyWhisperMessage):
         type = "pkmsg"
@@ -98,70 +87,84 @@ def encrypt(authState, plainText, recipientId, deviceId=1):
 
 
 @inlineCallbacks
-def _decryptPkMsg(authState, message, recipientId, deviceId):
+def _decryptPkMsg(signalStore, message, recipientId, deviceId):
     sessionRecord = yield maybeDeferred(
-        authState.store.loadSession, recipientId, deviceId)
+        signalStore.loadSession, recipientId, deviceId)
 
-    theirIdentityKey = message.getIdentityKey()
+    unsignedPreKeyId = yield _process(signalStore, sessionRecord, message, recipientId)
 
-    isTrustedIdentity = yield maybeDeferred(
-        authState.store.isTrustedIdentity, recipientId, theirIdentityKey)
+    plainText = _decryptWithSessionRecord(sessionRecord, message.getWhisperMessage())
 
-    if not isTrustedIdentity:
-        raise UntrustedIdentityException(recipientId, theirIdentityKey)
+    yield maybeDeferred(
+        signalStore.storeSession, recipientId, deviceId, sessionRecord)
 
-    unsignedPreKeyId = yield _processV3(authState, sessionRecord, message)
+    if unsignedPreKeyId is not None:
+        yield maybeDeferred(signalStore.removePreKey, unsignedPreKeyId)
 
-    # if unsignedPreKeyId is not None:
-    #     yield maybeDeferred(authState.store.removePreKey, unsignedPreKeyId)
-
-    yield maybeDeferred(authState.store.saveIdentity, recipientId, theirIdentityKey)
-
-    return _decryptWithSessionRecord(sessionRecord, message.getWhisperMessage())
+    return plainText
 
 
 @inlineCallbacks
-def _decryptMsg(authState, cipherText, recipientId, deviceId=1):
+def _decryptMsg(signalStore, cipherText, recipientId, deviceId=1):
     sessionExists = yield maybeDeferred(
-        authState.store.containSession, recipientId, deviceId)
+        signalStore.containSession, recipientId, deviceId)
 
     if not sessionExists:
         raise NoSessionException("No session for: %s, %s" % (recipientId, deviceId))
 
     sessionRecord = yield maybeDeferred(
-        authState.store.loadSession, recipientId, deviceId)
+        signalStore.loadSession, recipientId, deviceId)
 
     plaintext = _decryptWithSessionRecord(sessionRecord, cipherText)
 
     yield maybeDeferred(
-        authState.store.storeSession, recipientId, deviceId, sessionRecord)
+        signalStore.storeSession, recipientId, deviceId, sessionRecord)
 
     return plaintext
 
 
 @inlineCallbacks
-def _processV3(authState, sessionRecord, message):
+def _process(signalStore, sessionRecord, message, recipientId):
+    theirIdentityKey = message.getIdentityKey()
+
+    isTrustedIdentity = yield maybeDeferred(
+        signalStore.isTrustedIdentity, recipientId, theirIdentityKey)
+
+    if not isTrustedIdentity:
+        raise UntrustedIdentityException(recipientId, theirIdentityKey)
+
+    unsignedPreKeyId = yield _processV3(signalStore, sessionRecord, message)
+
+    yield maybeDeferred(signalStore.saveIdentity, recipientId, theirIdentityKey)
+
+    return unsignedPreKeyId
+
+
+@inlineCallbacks
+def _processV3(signalStore, sessionRecord, message):
+    if sessionRecord.hasSessionState(message.getMessageVersion(), message.getBaseKey().serialize()):
+        # logger.warn("We've already setup a session for this V3 message, letting bundled message fall through...")
+        return None
+
     if sessionRecord.hasSessionState(
         message.getMessageVersion(), message.getBaseKey().serialize()
     ):
         return None
 
     signedPrekey = yield maybeDeferred(
-        authState.store.loadSignedPreKey, message.getSignedPreKeyId())
+        signalStore.loadSignedPreKey, message.getSignedPreKeyId())
     ourSignedPreKey = signedPrekey.getKeyPair()
 
-    identityKeyPair = yield maybeDeferred(authState.store.getIdentityKeyPair)
+    identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
 
     parameters = BobAxolotlParameters.newBuilder()
-    parameters.setTheirBaseKey(message.getBaseKey())\
-        .setTheirIdentityKey(message.getIdentityKey())\
-        .setOurIdentityKey(identityKeyPair)\
-        .setOurSignedPreKey(ourSignedPreKey)\
+    parameters.setTheirBaseKey(message.getBaseKey()).setTheirIdentityKey(message.getIdentityKey())\
+        .setOurIdentityKey(identityKeyPair).setOurSignedPreKey(ourSignedPreKey)\
         .setOurRatchetKey(ourSignedPreKey)
 
     if message.getPreKeyId() is not None:
         preKey = yield maybeDeferred(
-            authState.store.loadPreKey, message.getPreKeyId())
+            signalStore.loadPreKey, message.getPreKeyId())
         parameters.setOurOneTimePreKey(preKey.getKeyPair())
     else:
         parameters.setOurOneTimePreKey(None)
@@ -172,12 +175,12 @@ def _processV3(authState, sessionRecord, message):
     RatchetingSession.initializeSessionAsBob(
         sessionRecord.getSessionState(), parameters.create())
 
-    localRegistrationid = yield maybeDeferred(authState.store.getLocalRegistrationId)
+    localRegistrationid = yield maybeDeferred(signalStore.getLocalRegistrationId)
     sessionRecord.getSessionState().setLocalRegistrationId(localRegistrationid)
     sessionRecord.getSessionState().setRemoteRegistrationId(message.getRegistrationId())
     sessionRecord.getSessionState().setAliceBaseKey(message.getBaseKey().serialize())
 
-    if message.getPreKeyId() is not None and message.getPreKeyId() != _MEDIUM_MAX_VALUE:
+    if message.getPreKeyId() is not None and message.getPreKeyId() != Medium.MAX_VALUE:
         return message.getPreKeyId()
 
     return None
@@ -281,9 +284,9 @@ def _getCipherText(messageKeys, plainText):
 
 
 @inlineCallbacks
-def processPreKeyBundle(authState, preKey, recipientId, deviceId=1):
+def processPreKeyBundle(signalStore, preKey, recipientId, deviceId=1):
     isTrustedIdentity = yield maybeDeferred(
-        authState.store.isTrustedIdentity, recipientId, preKey.getIdentityKey())
+        signalStore.isTrustedIdentity, recipientId, preKey.getIdentityKey())
 
     if not isTrustedIdentity:
         raise UntrustedIdentityException(recipientId, preKey.getIdentityKey())
@@ -298,7 +301,7 @@ def processPreKeyBundle(authState, preKey, recipientId, deviceId=1):
         raise InvalidKeyException("No signed prekey!!")
 
     sessionRecord = yield maybeDeferred(
-        authState.store.loadSession, recipientId, deviceId)
+        signalStore.loadSession, recipientId, deviceId)
 
     ourBaseKey = Curve.generateKeyPair()
     theirSignedPreKey = preKey.getSignedPreKey()
@@ -307,14 +310,11 @@ def processPreKeyBundle(authState, preKey, recipientId, deviceId=1):
 
     parameters = AliceAxolotlParameters.newBuilder()
 
-    identityKeyPair = yield maybeDeferred(authState.store.getIdentityKeyPair)
+    identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
 
-    parameters.setOurBaseKey(ourBaseKey)\
-        .setOurIdentityKey(identityKeyPair)\
-        .setTheirIdentityKey(preKey.getIdentityKey())\
-        .setTheirSignedPreKey(theirSignedPreKey)\
-        .setTheirRatchetKey(theirSignedPreKey)\
-        .setTheirOneTimePreKey(theirOneTimePreKey)
+    parameters.setOurBaseKey(ourBaseKey).setOurIdentityKey(identityKeyPair)\
+        .setTheirIdentityKey(preKey.getIdentityKey()).setTheirSignedPreKey(theirSignedPreKey)\
+        .setTheirRatchetKey(theirSignedPreKey).setTheirOneTimePreKey(theirOneTimePreKey)
 
     if not sessionRecord.isFresh():
         sessionRecord.archiveCurrentState()
@@ -325,14 +325,29 @@ def processPreKeyBundle(authState, preKey, recipientId, deviceId=1):
                                                                    preKey.getSignedPreKeyId(),
                                                                    ourBaseKey.getPublicKey())
 
-    localRegistrationId = yield maybeDeferred(authState.store.getLocalRegistrationId)
+    localRegistrationId = yield maybeDeferred(signalStore.getLocalRegistrationId)
 
     sessionRecord.getSessionState().setLocalRegistrationId(localRegistrationId)
     sessionRecord.getSessionState().setRemoteRegistrationId(preKey.getRegistrationId())
     sessionRecord.getSessionState().setAliceBaseKey(ourBaseKey.getPublicKey().serialize())
 
     yield maybeDeferred(
-        authState.store.storeSession, recipientId, deviceId, sessionRecord)
+        signalStore.storeSession, recipientId, deviceId, sessionRecord)
 
     yield maybeDeferred(
-        authState.store.saveIdentity, recipientId, preKey.getIdentityKey())
+        signalStore.saveIdentity, recipientId, preKey.getIdentityKey())
+
+
+
+from axolotl.sessioncipher import SessionCipher
+from axolotl.sessionbuilder import SessionBuilder
+
+
+class WamdSessionCipher(SessionCipher):
+
+    def __init__(self):
+        pass
+
+
+class WamdSessionBuilder(SessionBuilder):
+    pass

@@ -21,14 +21,14 @@ class ReceiptHandler(NodeHandler):
 
         if node['type'] is not None:
             ackNode['type'] = node['type']
-            
+
         conn.sendMessageNode(ackNode)
 
 
 class AckHandler(NodeHandler):
 
     def handleNode(self, conn, node):
-        selfJid = conn.getSelfJid()
+        selfJid = conn.deviceJid
 
         if selfJid == node['from'] and node['class'] == "receipt" and node['type'] == "peer_msg":
             conn.sendMessageNode(Node(

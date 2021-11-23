@@ -1,9 +1,16 @@
+import base64
+
+from zope.interface import implementer
+
 from axolotl.state.sessionrecord import SessionRecord
 from axolotl.state.signedprekeyrecord import SignedPreKeyRecord
 from axolotl.invalidkeyidexception import InvalidKeyIdException
-from axolotl.invalidkeyexception import InvalidKeyException
+from axolotl.state.prekeyrecord import PreKeyRecord
+
+from wamd.iface import IJsonSerializable
 
 
+@implementer(IJsonSerializable)
 class DefaultMemoryStore:
 
     def __init__(self):
@@ -15,13 +22,13 @@ class DefaultMemoryStore:
     def loadSession(self, recipientId, deviceId):
         key = "%s:%s" % (recipientId, deviceId, )
         try:
-            return SessionRecord(serialized=self._sessionStore[key])
+            return self._sessionStore[key]
         except KeyError:
             return SessionRecord()
 
     def storeSession(self, recipientId, deviceId, sessionRecord):
         key = "%s:%s" % (recipientId, deviceId, )
-        self._sessionStore[key] = sessionRecord.serialize()
+        self._sessionStore[key] = sessionRecord
 
     def containSession(self, recipientId, deviceId):
         key = "%s:%s" % (recipientId, deviceId, )
@@ -49,7 +56,7 @@ class DefaultMemoryStore:
         try:
             return self._preKeyStore[preKeyId]
         except KeyError:
-            raise InvalidKeyException("No Such Prekey!, preKeyId: %s" % (preKeyId, ))
+            raise InvalidKeyIdException("No Such Prekey!, preKeyId: %s" % (preKeyId, ))
 
     def storePreKey(self, preKeyId, preKey):
         self._preKeyStore[preKeyId] = preKey
@@ -59,3 +66,39 @@ class DefaultMemoryStore:
             del self._preKeyStore[preKeyId]
         except KeyError:
             pass
+
+    def toJson(self):
+        jsonDict = {}
+
+        if self._preKeyStore:
+            jsonDict['preKeys'] = {}
+            for k in self._preKeyStore:
+                preKey = self._preKeyStore[k]
+                jsonDict['preKeys'][preKey.getId()] = base64.b64encode(preKey.serialize()).decode()
+
+        if self._sessionStore:
+            jsonDict['sessions'] = {}
+            for recipientId in self._sessionStore:
+                sessionRecord = self._sessionStore[recipientId]
+                jsonDict['sessions'][recipientId] = base64.b64encode(sessionRecord.serialize()).decode()
+
+        return jsonDict
+
+    def populate(self, jsonDict):
+        try:
+            preKeys = jsonDict.pop("preKeys")
+        except KeyError:
+            pass
+        else:
+            for k in preKeys:
+                preKey = PreKeyRecord(serialized=base64.b64decode(preKeys[k]))
+                self._preKeyStore[preKey.getId()] = preKey
+
+        try:
+            sessions = jsonDict.pop("sessions")
+        except KeyError:
+            pass
+        else:
+            for recipientId, serialized in sessions.items():
+                self._sessionStore[recipientId] = SessionRecord(
+                    serialized=base64.b64decode(serialized))

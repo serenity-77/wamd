@@ -3,6 +3,8 @@ import base64
 import os
 import json
 
+from io import BytesIO
+
 from twisted.internet.defer import (
     inlineCallbacks, Deferred, maybeDeferred, succeed, fail
 )
@@ -32,25 +34,39 @@ from axolotl.util.keyhelper import KeyHelper
 from axolotl.state.prekeybundle import PreKeyBundle
 from axolotl.identitykey import IdentityKey
 
+
 from .constants import Constants
 from .common import AuthState
 from .errors import (
     ConnectionClosedError,
     AuthenticationFailedError,
     StreamEndError,
-    NodeStreamError
+    NodeStreamError,
+    SendMessageError
 )
 from .coder import (
     encodeInt, decodeInt, WABinaryReader, WABinaryWriter,
     splitJid, Node
 )
 
-from .utils import generateRandomNumber, toHex, inflate
+from .utils import (
+    generateRandomNumber,
+    toHex,
+    inflate,
+    sha256Hash,
+    mimeTypeFromBuffer,
+    mediaTypeFromMime,
+    encryptMedia,
+    processImage,
+    addRandomPadding,
+    FFMPEGVideoAdapter
+)
 from .handlers import createNodeHander
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import WhatsAppMessage, TextMessage, MediaMessage
 from .signalhelper import processPreKeyBundle, encrypt as signalEncrypt
+from .http import request as doHttpRequest
 
 
 _VALID_EVENTS = ["open", "qr", "close", "inbox", "ack"]
@@ -67,7 +83,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
     _serverHelloDeferred = None
 
-    def __init__(self, authState=None, reactor=None):
+    def __init__(self, authState=None, useSentQueue=False, reactor=None):
         WebSocketClientProtocol.__init__(self)
 
         validEvents = [] if self._valid_events is None else self._valid_events.copy()
@@ -84,6 +100,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
         self._pendingRequest = {}
         self._nodeHandlers = {}
+        self._cachedMedia = {}
 
 
     def onOpen(self):
@@ -106,8 +123,6 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         else:
             failure = None
 
-        # print()
-        # print("failure: %s, self.factory.authDeferred: %r" % (failure, self.factory.authDeferred, ))
         if failure is not None and self.factory.authDeferred is not None:
             self.factory.authFailure(failure)
         else:
@@ -120,7 +135,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                 excReason = ConnectionClosedError(reason="Connection Closed Cleanly")
             elif isinstance(failure.value, NodeStreamError):
                 if failure.value.code == "401":
-                    excReason = ConnectionClosedError(isLoggedOut=True, reason="Device Logged Out")
+                    excReason = ConnectionClosedError(isLoggedOut=True, reason="Logged Out")
                 else:
                     excReason = ConnectionClosedError(reason="Unhandled Stream Error")
             elif isinstance(failure.value, AuthenticationFailedError):
@@ -157,9 +172,9 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                     try:
                         decrypted = self._recvCipher.decrypt_with_ad(b"", encrypted)
                     except:
-                        self._handleFailure(Failure(), disconnect=True)
+                        self._handleFailure(Failure())
                     else:
-                        self.log.debug("Decrypted Message: [{decrypted}]", decrypted=toHex(decrypted))
+                        self.log.debug("OnMessage, Decrypted: [{decrypted}]", decrypted=toHex(decrypted))
 
                         try:
                             if decrypted[0] & Constants.FLAG_COMPRESSED:
@@ -181,17 +196,16 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
     _failure = None
 
-    def _handleFailure(self, failure, disconnect=False):
+    def _handleFailure(self, failure):
+        if isinstance(failure, Exception):
+            failure = Failure(failure)
+
         self.log.error("Handle Failure: {failure}", failure=failure)
 
-        self._failure = failure
-
         if not self._authDone():
+            self._failure = failure
             self._sendCipher = None
             self._recvCipher = None
-
-        if disconnect:
-            self.sendClose(code=1000)
 
     @inlineCallbacks
     def _doHandshake(self):
@@ -333,7 +347,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             companionRegData.companionProps = companionProps.SerializeToString()
             companionRegData.eRegid = encodeInt(self.authState.registrationId, 4)
             companionRegData.eKeytype = encodeInt(5, 1)
-            companionRegData.eIdent = self.authState.signedIdentityKey.getPublicKey().getPublicKey()
+            companionRegData.eIdent = self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()
             companionRegData.eSkeyId = encodeInt(self.authState.signedPrekey.getId(), 3)
             companionRegData.eSkeyVal = self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()
             companionRegData.eSkeySig = self.authState.signedPrekey.getSignature()
@@ -414,9 +428,14 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         self.sendMessageNode(node)
         return deferred
 
-    def getSelfJid(self):
-        user, _, _, server = splitJid(self.authState.me['jid'])
-        return "%s@%s" % (user, server)
+    _deviceJid = None
+
+    @property
+    def deviceJid(self):
+        if self._deviceJid is None:
+            user, _, _, server = splitJid(self.authState.me['jid'])
+            self._deviceJid = "%s@%s" % (user, server)
+        return self._deviceJid
 
     def sendReadReceipt(self, message):
         try:
@@ -431,7 +450,11 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             return fail(Failure())
         return succeed(None)
 
-    def sendWhatsAppMessage(self, message):
+    def sendMsg(self, message):
+        # TODO
+        # Implement queue/locking.
+        # So that only one message can be sent at a time.
+
         if not isinstance(message, WhatsAppMessage):
             return fail(
                 TypeError("Must be an instance of %s" % qual(WhatsAppMessage))
@@ -444,33 +467,227 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
         if isinstance(message, TextMessage):
             d = self._processTextMessageAndSend(message)
+            messageType = "text"
+
         elif isinstance(message, MediaMessage):
             d = self._processMediaMessageAndSend(message)
+            messageType = "media"
 
-        return d.addCallback(lambda ignored: message)
+        def _wrapFailure(failure):
+            try:
+                failure.trap(SendMessageError)
+            except:
+                failure = Failure(
+                    SendMessageError("%s" % (failure)))
+            return failure
+
+        @inlineCallbacks
+        def _onParticipantsNode(participantsNode):
+            messageNode = Node(
+                "message", {
+                    'id': message['id'],
+                    'to': message['to'],
+                    'type': messageType
+                },
+                participantsNode)
+
+            hasPkMsg = list(filter(
+                lambda toNode: toNode.getChild("enc")['type'] == "pkmsg",
+                participantsNode.findChilds("to")))
+
+            if hasPkMsg:
+                messageNode.addChild(self._buildDeviceIdentityNode())
+
+            yield self.request(messageNode) # Ignore response ack
+
+            return message # passthrough
+
+        return d.addCallback(
+            _onParticipantsNode).addErrback(_wrapFailure)
 
 
     @inlineCallbacks
     def _processTextMessageAndSend(self, message):
+        return (yield self._createParticipantsForMessage(message))
+
+    @inlineCallbacks
+    def _processMediaMessageAndSend(self, message):
+        if message['url'].startswith("http:") or message['url'].startswith("https:"):
+            # TODO
+            # Download from http
+            pass
+        else:
+            if not os.path.exists(message['url']):
+                raise FileNotFoundError("File %s not found" % (message['url']))
+
+            fileIO = open(message['url'], "rb")
+            fileContent = fileIO.read()
+            fileIO.close()
+
+        fileSha256 = sha256Hash(fileContent)
+        savedMedia = yield maybeDeferred(self._maybeGetCachedMedia, fileSha256)
+
+        if savedMedia is None:
+            mediaData = {}
+
+            if message['mimetype'] is not None:
+                mimeType = message['mimetype']
+            else:
+                mimeType = mimeTypeFromBuffer(fileContent)
+
+            mediaType = mediaTypeFromMime(mimeType)
+
+            encryptResult = encryptMedia(fileContent, mediaType)
+
+            mediaData['mimetype'] = mimeType
+            mediaData['fileSha256'] = base64.b64encode(fileSha256).decode()
+            mediaData['fileLength'] = len(fileContent)
+            mediaData['mediaKey'] = base64.b64encode(encryptResult['mediaKey']).decode()
+            mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
+            mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
+
+            if mediaType == "image":
+                yield maybeDeferred(self._addImageInfo, message, fileContent, mediaData)
+
+            elif mediaType == "document":
+                yield maybeDeferred(self._addDocumentInfo, message, fileContent, mediaData)
+
+            elif mediaType == "video":
+                yield maybeDeferred(self._addVideoInfo, message, fileContent, mediaData)
+
+            elif mediaType == "audio":
+                yield maybeDeferred(self._addAudioInfo, message, fileContent, mediaData)
+
+            uploadToken = base64.urlsafe_b64encode(encryptResult['fileEncSha256']).decode()
+
+            # Upload media
+            yield self._addUploadInfo(
+                uploadToken,
+                encryptResult['enc'] + encryptResult['mac'],
+                mediaData)
+
+            yield maybeDeferred(
+                self._maybeSaveCachedMedia,
+                fileSha256,
+                {'mediaType': mediaType, 'mediaData': mediaData})
+        else:
+            self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
+            mediaType = savedMedia['mediaType']
+            mediaData = savedMedia['mediaData']
+
+        message['mediaType'] = mediaType
+
+        for k, v in mediaData.items():
+            message[k] = v
+
         participantsNode = yield self._createParticipantsForMessage(message)
 
-        messageNode = Node(
-            "message", {
-                'id': message['id'],
-                'to': message['to'],
-                'type': "text"
-            },
-            participantsNode)
+        for toNode in participantsNode.findChilds("to"):
+            encNode = toNode.findChild("enc")
+            encNode['mediatype'] = mediaType
 
-        messageNode.addChild(self._buildDeviceIdentityNode())
-
-        yield self.request(messageNode) # Just ignore the ack node response
+        return participantsNode
 
 
     @inlineCallbacks
+    def _addUploadInfo(self, uploadToken, body, mediaData):
+        mediaConnInfo = yield self.request(Node(
+            "iq", {
+                'to': Constants.S_WHATSAPP_NET,
+                'xmlns': "w:m",
+                'type': "set",
+                'id': self._generateMessageId()
+            }, Node("media_conn")
+        ))
+
+        mediaConn = mediaConnInfo.findChild("media_conn")
+        hostList = mediaConn.findChilds("host")
+
+        uploadUrl = "https://{hostName}/mms/image/{uploadToken}".format(
+            hostName=hostList[0]['hostname'],
+            uploadToken=uploadToken)
+
+        uploadResult = yield doHttpRequest(
+            uploadUrl,
+            method="POST",
+            data=body,
+            query={
+                'auth': mediaConn['auth'],
+                'token': uploadToken
+            },
+            headers={
+                'Origin': Constants.WHATSAPP_WEBSOCKET_HOST.rstrip("/"),
+                'Referer': Constants.WHATSAPP_WEBSOCKET_HOST.rstrip("/") + "/",
+                'User-Agent': Constants.DEFAULT_USER_AGENT
+            })
+
+        uploadResultDict = json.loads(uploadResult)
+
+        mediaData['url'] = uploadResultDict['url']
+        mediaData['directPath'] = uploadResultDict['direct_path']
+
+
+    def _addImageInfo(self, message, imageBytes, mediaData):
+        height, width, thumbnail = processImage(imageBytes, mediaData['mimetype'])
+        mediaData['height'] = height
+        mediaData['width'] = width
+        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode()
+
+    def _addDocumentInfo(self, message, documentBytes, mediaData):
+        pathSplit = os.path.splitext(message['url'])
+
+        if message['title'] is None:
+            mediaData['title'] = pathSplit[0].split("/")[-1]
+        else:
+            mediaData = message['title']
+
+        if message['fileName'] is None:
+            if not pathSplit[1]:
+                fileName = pathSplit[0].split("/")[-1]
+            else:
+                fileName = "%s%s" % (pathSplit[0].split("/")[-1], pathSplit[1])
+            mediaData['fileName'] = fileName
+        else:
+            mediaData['fileName'] = message['fileName']
+
+    @inlineCallbacks
+    def _addVideoInfo(self, message, videoBytes, mediaData):
+        adapter = FFMPEGVideoAdapter.fromBytes(videoBytes)
+        yield adapter.ready()
+        duration = int(adapter.info['format']['duration'])
+        frameIO = BytesIO()
+        yield adapter.saveFrame(frameIO, int(duration // 2))
+        _, _, jpegThumbnail = processImage(frameIO.getvalue(), "image/jpeg")
+        frameIO.close()
+        mediaData['seconds'] = duration
+        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode()
+
+    @inlineCallbacks
+    def _addAudioInfo(self, message, audioBytes, mediaData):
+        if mediaData['mimetype'] == "application/ogg":
+            mediaData['mimetype'] = "audio/ogg; codecs=opus"
+            mediaData['ptt'] = True
+        adapter = FFMPEGVideoAdapter.fromBytes(audioBytes)
+        yield adapter.ready()
+        duration = int(adapter.info['format']['duration'])
+        mediaData['seconds'] = duration
+
+    @inlineCallbacks
     def _createParticipantsForMessage(self, message):
-        destUser, _, _, server = splitJid(message['to'])
-        meUser, _, _, meServer  = splitJid(self.getSelfJid())
+        destUser, destServer = message['to'].split("@")
+        meUser, meServer = self.deviceJid.split("@")
+
+        messageProto = message.toProtobufMessage()
+
+        print("\n\nmessageProto:\n")
+        print(messageProto)
+
+        deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
+        deviceSentMessageProto.destinationJid = message['to']
+        deviceSentMessageProto.message.MergeFrom(messageProto)
+
+        deviceMessageProto = WAMessage_pb2.Message()
+        deviceMessageProto.deviceSentMessage.MergeFrom(deviceSentMessageProto)
 
         sessionExists = yield maybeDeferred(self.authState.store.containSession, destUser, 1)
         sessionMeExists = yield maybeDeferred(self.authState.store.containSession, meUser, 1)
@@ -480,40 +697,31 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             keyRequestJids.append(message['to'])
 
         if not sessionMeExists:
-            keyRequestJids.append(self.getSelfJid())
+            keyRequestJids.append(self.deviceJid)
 
         if keyRequestJids:
             preKeyBundles = yield self._requestPreKeyBundles(keyRequestJids)
 
             for jid, preKeyBundle in preKeyBundles.items():
-                yield processPreKeyBundle(self.authState, preKeyBundle, jid.split("@")[0])
-
-        messageProto = message.toProtobufMessage()
-
-        deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
-        deviceSentMessageProto.destinationJid = message['to']
-        deviceSentMessageProto.message.MergeFrom(messageProto)
-
-        deviceMessageProto = WAMessage_pb2.Message()
-        deviceMessageProto.deviceSentMessage.MergeFrom(deviceSentMessageProto)
+                yield processPreKeyBundle(self.authState.store, preKeyBundle, jid.split("@")[0])
 
         destType, destCipherText = yield signalEncrypt(
-            self.authState,
-            messageProto.SerializeToString(),
+            self.authState.store,
+            addRandomPadding(messageProto.SerializeToString()),
             destUser)
 
         destEncNode = Node("enc", {'v': "2", 'type': destType}, destCipherText)
 
         deviceType, deviceCipherText = yield signalEncrypt(
-            self.authState,
-            deviceMessageProto.SerializeToString(),
+            self.authState.store,
+            addRandomPadding(deviceMessageProto.SerializeToString()),
             meUser)
 
         deviceEncNode = Node("enc", {'v': "2", 'type': deviceType}, deviceCipherText)
 
         participantsNode = Node("participants", None, [
             Node("to", {'jid': message['to']}, destEncNode),
-            Node("to", {'jid': self.getSelfJid()}, deviceEncNode)
+            Node("to", {'jid': self.deviceJid}, deviceEncNode)
         ])
 
         return participantsNode
@@ -534,10 +742,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         keyNode = Node("key")
 
         for jid in jids:
-            userNode = Node("user", {
-                'jid': jid
-            })
-            keyNode.addChild(userNode)
+            keyNode.addChild(Node("user", {'jid': jid}))
 
         iqNode.addChild(keyNode)
 
@@ -561,7 +766,8 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
             preKeyBundles[userNode['jid']] = PreKeyBundle(
                 registrationId, 1, preKeyId, preKeyPublic,
-                signedPreKeyId, signedPreKeyPublic, signedPreKeySignature, identityKey)
+                signedPreKeyId, signedPreKeyPublic, signedPreKeySignature,
+                identityKey)
 
         return preKeyBundles
 
@@ -580,13 +786,16 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             deviceIdentityProto.SerializeToString())
 
     @inlineCallbacks
-    def _uploadPreKeys(self):
+    def _uploadPreKeys(self, count=None):
         nextPrekeyId = self.authState.nextPrekeyId
 
         self.log.debug("Uploading Prekeys")
 
-        preKeys = KeyHelper.generatePreKeys(nextPrekeyId, 10)
-        maxPreKeyId = [key.getId() for key in preKeys][-1]
+        if count is None:
+            count = 30 # whatsapp web send 30
+
+        preKeys = KeyHelper.generatePreKeys(nextPrekeyId, count)
+        maxPreKeyId = max([key.getId() for key in preKeys])
 
         preKeysContent = []
 
@@ -609,11 +818,11 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                 'id': self._generateMessageId(),
                 'xmlns': "encrypt",
                 'type': "set",
-                'to': "@s.whatsapp.net"
+                'to': Constants.S_WHATSAPP_NET
             }, content=[
                 Node("registration", None, encodeInt(self.authState.registrationId, 4)),
                 Node("type", None, encodeInt(curve.Curve.DJB_TYPE, 1)),
-                Node("identity", None, self.authState.signedIdentityKey.getPublicKey().getPublicKey()),
+                Node("identity", None, self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
                 Node("list", None, preKeysContent),
                 Node("skey", None, [
                     Node("id", None, encodeInt(self.authState.signedPrekey.getId(), 3)),
@@ -622,7 +831,32 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                 ])
             ]))
 
-        self.authState.nextPrekeyId = nextPrekeyId + 1
+        self.authState.nextPrekeyId = maxPreKeyId + 1
+
+    def _sendRetryRequest(self, messageNode):
+        retryCount = messageNode.findChild("enc")['count']
+
+        if retryCount is not None:
+            retryCount = str(int(retryCount) + 1)
+        else:
+            retryCount = "1"
+
+        self.request(Node(
+            "receipt", {
+                'id': messageNode['id'],
+                'type': "retry",
+                'to': messageNode['from'],
+                't': messageNode['t']
+            }, [
+                Node("retry", {
+                    'count': retryCount,
+                    'id': messageNode['id'],
+                    'v': "1",
+                    't': messageNode['t']
+                }),
+                Node("registration", None, encodeInt(self.authState.registrationId, 4))
+            ]
+        ))
 
     def _restart(self):
         self.log.info("Authentication Success, Restarting Connection")
@@ -639,7 +873,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             return self.request(Node(
                 "iq", attributes={
                     'id': self._generateMessageId(),
-                    'to': "@s.whatsapp.net",
+                    'to': Constants.S_WHATSAPP_NET,
                     'type': "get",
                     'xmlns': "w:p"
                 }, content=Node("ping")
@@ -668,6 +902,14 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
         return messageTag
 
+    def _maybeGetCachedMedia(self, cachedKey):
+        try:
+            return self._cachedMedia[cachedKey]
+        except KeyError:
+            return None
+
+    def _maybeSaveCachedMedia(self, cachedKey, mediaData):
+        self._cachedMedia[cachedKey] = mediaData
 
 
 class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):

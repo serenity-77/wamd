@@ -2,6 +2,15 @@ import os
 import binascii
 import zlib
 import json
+import magic
+import time
+import random
+import math
+
+
+from twisted.python import procutils
+from twisted.internet.defer import Deferred, maybeDeferred, succeed
+from twisted.internet.utils import getProcessOutput, _UnexpectedErrorOutput
 
 from google.protobuf import json_format
 
@@ -10,8 +19,12 @@ from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from io import BytesIO
+from PIL import Image
+
 from .coder import decodeInt
 from .errors import InvalidMediaSignature
+from .constants import Constants
 
 
 _CRYPTO_BACKEND = default_backend()
@@ -52,19 +65,11 @@ def hmacValidate(signKey, hmacSignature, data, size=None):
     return signature == hmacSignature
 
 
-_MEDIA_KEYS = {
-    "image": b"WhatsApp Image Keys",
-    "video": b"WhatsApp Video Keys",
-    "audio": b"WhatsApp Audio Keys",
-    "document": b"WhatsApp Document Keys",
-    "history": b"WhatsApp History Keys"
-}
-
-def getMediaKeys(mediaType):
+def getMediaInfoKey(mediaType):
     try:
-        return _MEDIA_KEYS[mediaType]
-    except:
-        return b""
+        return Constants.MEDIA_INFO_KEYS[mediaType]
+    except KeyError:
+        raise ValueError("Unsupported Media Type: %s" % (mediaType, ))
 
 
 def decryptMedia(encryptedMedia, mediaKey, mediaType):
@@ -72,7 +77,7 @@ def decryptMedia(encryptedMedia, mediaKey, mediaType):
         algorithm=hashes.SHA256(),
         length=112,
         salt=None,
-        info=getMediaKeys(mediaType),
+        info=getMediaInfoKey(mediaType),
         backend=_CRYPTO_BACKEND
     ).derive(mediaKey)
 
@@ -84,7 +89,7 @@ def decryptMedia(encryptedMedia, mediaKey, mediaType):
     hmacSignature = encryptedMedia[-10:]
 
     if not hmacValidate(macKey, hmacSignature, iv + mediaEncrypted, size=10):
-        raise InvalidMediaSignature("Invalid media signature")
+        raise InvalidMediaSignature("Media Hmac Validation Failed")
 
     cipher = Cipher(algorithms.AES(cipherKey), modes.CBC(iv), backend=_CRYPTO_BACKEND)
     decryptor = cipher.decryptor()
@@ -94,80 +99,34 @@ def decryptMedia(encryptedMedia, mediaKey, mediaType):
 
 
 def addPadding(data, padLength=16):
-    length = len(data)
-    if length % padLength == 0:
-        return data
-    return data + (b"\x00" * (16 - (length % padLength)))
-
-
-_IMAGE_MIME_TYPES = [
-    "image/jpeg",
-    "image/png",
-    "image/jpg",
-    "image/webp",
-    "image/tiff",
-    "image/gif",
-    "image/bmp"
-]
-
-_VIDEO_MIME_TYPES = [
-    "video/mp4",
-    "video/3gpp",
-    "video/3gp",
-    "video/mpeg",
-    "video/ogg",
-    "video/x-msvideo"
-]
-
-_AUDIO_MIME_TYPES = [
-    "audio/mpeg",
-    "audio/ogg",
-    "audio/opus",
-    "audio/wav",
-    "audio/x-wav",
-    "audio/webm",
-]
-
-_DOCUMENT_MIME_TYPES = [
-    "application/pdf",
-    "application/zip",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "text/csv",
-    "text/plain",
-    "application/x-tar",
-    "application/vnd.ms-excel",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/x-7z-compressed",
-    "application/x-bzip",
-    "application/x-bzip2"
-]
+    padN = 16 - (len(data) % padLength)
+    return data + bytes([padN] * padN)
 
 
 def mediaTypeFromMime(mime):
-    if mime in _IMAGE_MIME_TYPES:
-        type = "image"
-    elif mime in _VIDEO_MIME_TYPES:
-        type = "video"
-    elif mime in _AUDIO_MIME_TYPES:
-        type = "audio"
-    elif mime in _DOCUMENT_MIME_TYPES:
-        type = "document"
+    if mime in Constants.IMAGE_MIME_TYPES:
+        mediaType = "image"
+    elif mime in Constants.VIDEO_MIME_TYPES:
+        mediaType = "video"
+    elif mime in Constants.AUDIO_MIME_TYPES:
+        mediaType = "audio"
+    elif mime in Constants.DOCUMENT_MIME_TYPES:
+        mediaType = "document"
     else:
         raise ValueError("Unsupported mime: %s" % (mime, ))
 
-    return type
+    return mediaType
 
 
 def addSupportedMimeType(mime, type):
     if type == "image":
-        _TYPES = _IMAGE_MIME_TYPES
+        _TYPES = Constants.IMAGE_MIME_TYPES
     elif type == "video":
-        _TYPES = _VIDEO_MIME_TYPES
+        _TYPES = Constants.VIDEO_MIME_TYPES
     elif type == "audio":
-        _TYPES = _AUDIO_MIME_TYPES
+        _TYPES = Constants.AUDIO_MIME_TYPES
     elif type == "document":
-        _TYPES = _DOCUMENT_MIME_TYPES
+        _TYPES = Constants.DOCUMENT_MIME_TYPES
     else:
         raise ValueError("Unsupported type: %s" % (type, ))
 
@@ -183,3 +142,243 @@ def protoMessageToJson(protoMessage):
     return json.loads(
         json_format.MessageToJson(protoMessage)
     )
+
+
+def jsonToProtoMessage(jsonDict, protoFactory):
+    return json_format.ParseDict(
+        jsonDict, protoFactory(), ignore_unknown_fields=True)
+
+
+def sha256Hash(data):
+    digest = hashes.Hash(hashes.SHA256(), backend=_CRYPTO_BACKEND)
+    digest.update(data)
+    return digest.finalize()
+
+
+def mimeTypeFromBuffer(buffer):
+    return magic.from_buffer(buffer, mime=True)
+
+
+def encryptMedia(mediaBytes, mediaType):
+    mediaKey = os.urandom(32)
+
+    mediaKeyExpanded = HKDF(
+        algorithm=hashes.SHA256(),
+        length=112,
+        salt=None,
+        info=getMediaInfoKey(mediaType),
+        backend=_CRYPTO_BACKEND
+    ).derive(mediaKey)
+
+    iv = mediaKeyExpanded[:16]
+    cipherKey = mediaKeyExpanded[16:48]
+    macKey = mediaKeyExpanded[48:80]
+
+    cipher = Cipher(algorithms.AES(cipherKey), modes.CBC(iv), backend=_CRYPTO_BACKEND)
+    encryptor = cipher.encryptor()
+    enc = encryptor.update(addPadding(mediaBytes)) + encryptor.finalize()
+
+    h = hmac.HMAC(macKey, hashes.SHA256(), backend=_CRYPTO_BACKEND)
+    h.update(iv + enc)
+    hmacSha256 = h.finalize()
+    mac = hmacSha256[:10]
+
+    digestEncMac = hashes.Hash(hashes.SHA256(), backend=_CRYPTO_BACKEND)
+    digestEncMac.update(enc + mac)
+    fileEncSha256 = digestEncMac.finalize()
+
+    return {
+        'mediaKey': mediaKey,
+        'enc': enc,
+        'mac': mac,
+        'mediaKeyTimestamp': int(time.time()),
+        'fileEncSha256': fileEncSha256
+    }
+
+
+def processImage(imageBytes, mimeType):
+    imageIO = BytesIO(imageBytes)
+    image = Image.open(imageIO)
+
+    mediaHeight = image.height
+    mediaWidth = image.width
+
+    image.thumbnail((100, 200), Image.ANTIALIAS)
+    thumbnailIO = BytesIO()
+
+    if mimeType == "image/png":
+        format = "PNG"
+    elif mimeType == "image/jpg" or mimeType == "image/jpeg":
+        format = "JPEG"
+    else:
+        format = None
+
+    image.save(thumbnailIO, format=format)
+    thumbnail = thumbnailIO.getvalue()
+
+    imageIO.close()
+    thumbnailIO.close()
+    image.close()
+
+    return mediaHeight, mediaWidth, thumbnail
+
+
+def addRandomPadding(data):
+    n = 1 + (15 & random.randint(1, 255))
+    return data + (bytes([n] * n))
+
+
+def removeRandomPadding(data):
+    n = data[-1]
+    return data[:-n]
+
+
+try:
+    _FFMPEG_EXECUTABLE = procutils.which("ffmpeg")[0]
+except IndexError:
+    _FFMPEG_EXECUTABLE = None
+
+try:
+    _FFPROBE_EXECUTABLE = procutils.which("ffprobe")[0]
+except IndexError:
+    _FFPROBE_EXECUTABLE = None
+
+
+class FFMPEGAdapterError(Exception):
+    pass
+
+
+class FFMPEGVideoAdapter:
+
+    _isReady = False
+    _info = None
+
+    readyDeferred = None
+
+    def __init__(self, filepath, reactor=None):
+        if not _FFMPEG_EXECUTABLE:
+            raise RuntimeError("ffmpeg executable not found")
+
+        if not _FFPROBE_EXECUTABLE:
+            raise RuntimeError("ffprobe executable not found")
+
+        self._filepath = filepath
+
+        if reactor is None:
+            from twisted.internet import reactor
+        self._reactor = reactor
+
+        self._reactor.callLater(0, self._ffprobeInfo)
+
+    @classmethod
+    def fromBytes(cls, data, reactor=None):
+        path = os.path.join("/tmp/", binascii.hexlify(os.urandom(16)).decode())
+
+        with open(path, "wb") as fileIO:
+            fileIO.write(data)
+
+        return cls(path, reactor=reactor)
+
+    @property
+    def info(self):
+        if self._info is None:
+            return None
+        return self._info.copy()
+
+    def ready(self):
+        if self._isReady:
+            return succeed(None)
+        d = self.readyDeferred = Deferred()
+        return d
+
+    def saveFrame(self, fileIO, duration, format="jpeg"):
+        if not self._isReady:
+            raise RuntimeError("Not Ready yet")
+
+        if format == "jpeg":
+            format = "jpg"
+
+        if format not in ["jpg", "png"]:
+            raise ValueError("Invalid format %s" % (format, ))
+
+        # Fuck it
+        outputFilename = "{}.{}".format(
+            binascii.hexlify(os.urandom(16)).decode(),
+            format)
+
+        outputPath = os.path.join("/tmp/", outputFilename)
+
+        duration = str(math.floor(duration))
+
+        args = "-y -v error -i {input} -ss {duration} -vframes 1 {output}"
+
+        def callback(ign):
+            if os.path.exists(outputPath):
+                with open(outputPath, "rb") as outputIO:
+                    b = outputIO.read()
+                    fileIO.write(b)
+                try:
+                    os.remove(outputPath)
+                except:
+                    pass
+            else:
+                raise FFMPEGAdapterError("Frame save failed")
+
+        d = self._run(
+            _FFMPEG_EXECUTABLE,
+            args=args.format(
+                input=self._filepath,
+                duration=duration,
+                output=outputPath
+            ).split())
+
+        return d.addCallback(callback)
+
+
+    def _ffprobeInfo(self):
+        args="-v error -print_format json -show_format".split()
+        args.append(self._filepath)
+
+        def errback(failure):
+            d, self.readyDeferred = self.readyDeferred, None
+            d.errback(failure)
+
+        d = self._run(_FFPROBE_EXECUTABLE, args)
+
+        d.addCallback(self._ffprobeInfoDone)
+        d.addErrback(errback)
+
+    def _ffprobeInfoDone(self, result):
+        self._info = json.loads(result)
+        self._info['format']['duration'] = float(self._info['format']['duration'])
+        self._isReady = True
+        d, self.readyDeferred = self.readyDeferred, None
+        d.callback(None)
+
+    def _run(self, executable, args):
+        def callback(result):
+            deferred.callback(result)
+
+        def errback(failure):
+            try:
+                failure.trap(_UnexpectedErrorOutput)
+            except:
+                deferred.errback(failure)
+            else:
+                failure.value.processEnded.addErrback(
+                    lambda _: onProcessEnded(failure)
+                ).addErrback(lambda f: deferred.errback(f))
+
+        def onProcessEnded(failure):
+            # _UnexpectedErrorOutput ???
+            raise FFMPEGAdapterError(str(failure.value))
+
+        deferred = Deferred()
+
+        d = maybeDeferred(
+            getProcessOutput, executable, args=args, reactor=self._reactor)
+
+        d.addCallback(callback)
+        d.addErrback(errback)
+
+        return deferred

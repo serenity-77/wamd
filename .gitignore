@@ -6,3 +6,4 @@ src/wamd.egg-info
 build
 dist
 install.txt
+session.json

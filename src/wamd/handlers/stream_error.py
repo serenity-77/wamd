@@ -13,7 +13,7 @@ class StreamErrorHandler(NodeHandler):
         code = node['code']
 
         if code is not None:
-            if code == "515":
+            if code == "515" and not conn._authDone():
                 conn._restart()
             else:
                 if conn._authDone():

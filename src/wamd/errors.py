@@ -36,3 +36,8 @@ class NodeStreamError(WhatsAppError):
     def __init__(self, code, message=""):
         self.code = code
         WhatsAppError.__init__(self, "StreamError: %s" % (self.code, ))
+
+
+
+class SendMessageError(WhatsAppError):
+    pass

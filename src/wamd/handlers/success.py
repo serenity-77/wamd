@@ -8,7 +8,9 @@ class SuccessHandler(NodeHandler):
 
     @inlineCallbacks
     def handleNode(self, conn, node):
-        yield conn._uploadPreKeys()
+        if not conn.authState.serverHasPreKeys:
+            yield conn._uploadPreKeys()
+            conn.authState.serverHasPreKeys = True
 
         yield conn.request(
             Node("iq", {
