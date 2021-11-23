@@ -16,7 +16,7 @@ from .constants import Constants
 @implementer(IPolicyForHTTPS)
 class WebClientContextFactory:
     def creatorForNetloc(self, hostname, port):
-        return getTlsConnectionFactory()
+        return getTlsConnectionFactory(hostname)
 
 
 _agent = Agent(reactor, contextFactory=WebClientContextFactory())
@@ -134,7 +134,7 @@ def _defaultRequestFactory(url, method=b"GET", data=None, query=None, headers=No
 
     if method != b"GET" and data is not None:
         bodyProducer = HttpRequestBodyProducer(data, clock=reactor)
-        
+
     if headers is not None:
         tmpHeaders = {}
         for k, v in headers.items():
