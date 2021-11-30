@@ -6,6 +6,8 @@ from axolotl.state.sessionrecord import SessionRecord
 from axolotl.state.signedprekeyrecord import SignedPreKeyRecord
 from axolotl.invalidkeyidexception import InvalidKeyIdException
 from axolotl.state.prekeyrecord import PreKeyRecord
+from axolotl.groups.state.senderkeyrecord import SenderKeyRecord
+
 
 from wamd.iface import IJsonSerializable
 
@@ -18,6 +20,7 @@ class DefaultMemoryStore:
         self._identityKeyStore = {}
         self._preKeyStore = {}
         self._signedPrekeyStore = {}
+        self._senderKeyStore = {}
 
     def loadSession(self, recipientId, deviceId):
         key = "%s:%s" % (recipientId, deviceId, )
@@ -33,6 +36,13 @@ class DefaultMemoryStore:
     def containSession(self, recipientId, deviceId):
         key = "%s:%s" % (recipientId, deviceId, )
         return key in self._sessionStore
+
+    def removeSession(self, recipientId, deviceId):
+        key = "%s:%s" % (recipientId, deviceId, )
+        try:
+            del self._sessionStore[key]
+        except:
+            pass
 
     def isTrustedIdentity(self, recipientId, theirIdentityKey):
         return True
@@ -67,6 +77,17 @@ class DefaultMemoryStore:
         except KeyError:
             pass
 
+    def loadSenderKey(self, senderKeyName):
+        key = senderKeyName.serialize() # Keep it simple
+        try:
+            return self._senderKeyStore[key]
+        except KeyError:
+            return SenderKeyRecord()
+
+    def storeSenderKey(self, senderKeyName, senderKeyRecord):
+        key = senderKeyName.serialize() # Keep it simple
+        self._senderKeyStore[key] = senderKeyRecord
+
     def toJson(self):
         jsonDict = {}
 
@@ -78,9 +99,13 @@ class DefaultMemoryStore:
 
         if self._sessionStore:
             jsonDict['sessions'] = {}
-            for recipientId in self._sessionStore:
-                sessionRecord = self._sessionStore[recipientId]
+            for recipientId, sessionRecord in self._sessionStore.items():
                 jsonDict['sessions'][recipientId] = base64.b64encode(sessionRecord.serialize()).decode()
+
+        if self._senderKeyStore:
+            jsonDict['senderKeys'] = {}
+            for key, senderKeyRecord in self._senderKeyStore.items():
+                jsonDict['senderKeys'][key] = base64.b64encode(senderKeyRecord.serialize()).decode()
 
         return jsonDict
 
@@ -101,4 +126,13 @@ class DefaultMemoryStore:
         else:
             for recipientId, serialized in sessions.items():
                 self._sessionStore[recipientId] = SessionRecord(
+                    serialized=base64.b64decode(serialized))
+
+        try:
+            senderKeys = jsonDict.pop("senderKeys")
+        except KeyError:
+            pass
+        else:
+            for key, serialized in senderKeys.items():
+                self._senderKeyStore[key] = SenderKeyRecord(
                     serialized=base64.b64decode(serialized))

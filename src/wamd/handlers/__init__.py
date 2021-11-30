@@ -22,7 +22,7 @@ _HandlerMaps = {
 }
 
 
-def createNodeHander(tag, *args, **kwargs):
+def createNodeHandler(tag, *args, **kwargs):
     try:
         return _HandlerMaps[tag](*args, **kwargs)
     except KeyError:

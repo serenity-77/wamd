@@ -20,12 +20,19 @@ from axolotl.invalidmessageexception import InvalidMessageException
 from axolotl.duplicatemessagexception import DuplicateMessageException
 from axolotl.invalidkeyexception import InvalidKeyException
 from axolotl.nosessionexception import NoSessionException
+from axolotl.invalidkeyidexception import InvalidKeyIdException
 from axolotl.ecc.curve import Curve
 from axolotl.util.medium import Medium
+from axolotl.groups.senderkeyname import SenderKeyName as BaseSenderKeyName
+from axolotl.groups.groupcipher import GroupCipher
+from axolotl.groups.groupsessionbuilder import GroupSessionBuilder
+from axolotl.protocol.senderkeymessage import SenderKeyMessage
+from axolotl.protocol.senderkeydistributionmessage import SenderKeyDistributionMessage
+from axolotl.axolotladdress import AxolotlAddress
 
 
 @inlineCallbacks
-def decrypt(signalStore, cipherText, recipientId, deviceId=1, type="pkmsg"):
+def decrypt(signalStore, cipherText, recipientId, groupId=None, deviceId=1, type="pkmsg"):
     if type == "pkmsg":
         plainText = yield _decryptPkMsg(
             signalStore, PreKeyWhisperMessage(serialized=cipherText),
@@ -35,6 +42,11 @@ def decrypt(signalStore, cipherText, recipientId, deviceId=1, type="pkmsg"):
         plainText = yield _decryptMsg(
             signalStore, WhisperMessage(serialized=cipherText),
             recipientId, deviceId)
+
+    elif type == "skmsg":
+        plainText = yield _decryptSkMsg(
+            signalStore, cipherText,
+            SenderKeyName(groupId, AxolotlAddress(recipientId, 1)))
 
     else:
         raise NotImplementedError("Type: %s not implemented" % (type, ))
@@ -82,7 +94,6 @@ def encrypt(signalStore, paddedMessage, recipientId, deviceId=1):
     else:
         raise NotImplementedError("%s cipher text is not implemented" % qual(ciphertextMessage.__class__))
 
-    type = "pkmsg" if isinstance(ciphertextMessage, PreKeyWhisperMessage) else "msg"
     return type, ciphertextMessage.serialize()
 
 
@@ -338,16 +349,82 @@ def processPreKeyBundle(signalStore, preKey, recipientId, deviceId=1):
         signalStore.saveIdentity, recipientId, preKey.getIdentityKey())
 
 
+@inlineCallbacks
+def processSenderKeyDistributionMessage(signalStore, groupId, participantId, skMessage):
+    senderKeyName = SenderKeyName(groupId, AxolotlAddress(participantId, 1))
 
-from axolotl.sessioncipher import SessionCipher
-from axolotl.sessionbuilder import SessionBuilder
+    senderKeyRecord = yield maybeDeferred(signalStore.loadSenderKey, senderKeyName)
+
+    senderKeyDistributionMessage = SenderKeyDistributionMessage(serialized=skMessage)
+    senderKeyRecord.addSenderKeyState(senderKeyDistributionMessage.getId(),
+                                      senderKeyDistributionMessage.getIteration(),
+                                      senderKeyDistributionMessage.getChainKey(),
+                                      senderKeyDistributionMessage.getSignatureKey())
+
+    yield maybeDeferred(signalStore.storeSenderKey, senderKeyName, senderKeyRecord)
 
 
-class WamdSessionCipher(SessionCipher):
+@inlineCallbacks
+def _decryptSkMsg(signalStore, senderKeyMessageBytes, senderKeyName):
+    try:
+        record = yield maybeDeferred(
+            signalStore.loadSenderKey, senderKeyName)
 
-    def __init__(self):
-        pass
+        if record.isEmpty():
+            raise NoSessionException("No sender key for: %s" % senderKeyName)
+
+        senderKeyMessage = SenderKeyMessage(serialized = bytes(senderKeyMessageBytes))
+        senderKeyState = record.getSenderKeyState(senderKeyMessage.getKeyId())
+
+        senderKeyMessage.verifySignature(senderKeyState.getSigningKeyPublic())
+
+        senderKey = _getSenderKey(senderKeyState, senderKeyMessage.getIteration())
+
+        plaintext = _getSenderKeyText(senderKey.getIv(), senderKey.getCipherKey(), senderKeyMessage.getCipherText())
+
+        yield maybeDeferred(signalStore.storeSenderKey, senderKeyName, record)
+
+        return plaintext
+    except (InvalidKeyException, InvalidKeyIdException) as e:
+        raise InvalidMessageException(e)
 
 
-class WamdSessionBuilder(SessionBuilder):
-    pass
+def _getSenderKey(senderKeyState, iteration):
+    senderChainKey = senderKeyState.getSenderChainKey()
+
+    if senderChainKey.getIteration() > iteration:
+        if senderKeyState.hasSenderMessageKey(iteration):
+            return senderKeyState.removeSenderMessageKey(iteration)
+        else:
+            raise DuplicateMessageException("Received message with old counter: %s, %s" %
+                                            (senderChainKey.getIteration(), iteration))
+
+    if senderChainKey.getIteration() - iteration > 2000:
+        raise InvalidMessageException("Over 2000 messages into the future!")
+
+    while senderChainKey.getIteration() < iteration:
+        senderKeyState.addSenderMessageKey(senderChainKey.getSenderMessageKey())
+        senderChainKey = senderChainKey.getNext()
+
+    senderKeyState.setSenderChainKey(senderChainKey.getNext())
+    return senderChainKey.getSenderMessageKey()
+
+
+def _getSenderKeyText(iv, key, ciphertext):
+    """
+    :type iv: bytearray
+    :type key: bytearray
+    :type ciphertext: bytearray
+    """
+    try:
+        cipher = AESCipher(key, iv)
+        plaintext = cipher.decrypt(ciphertext)
+        return plaintext
+    except Exception as e:
+        raise InvalidMessageException(e)
+
+
+class SenderKeyName(BaseSenderKeyName):
+
+    def __str__(self):
+        return self.serialize()

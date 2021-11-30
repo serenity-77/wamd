@@ -1,5 +1,9 @@
+import time
+
 from .base import NodeHandler
-from wamd.coder import splitJid, Node
+from wamd.coder import Node
+from wamd.utils import splitJid
+from wamd.constants import Constants
 
 
 class ReceiptHandler(NodeHandler):
@@ -19,26 +23,21 @@ class ReceiptHandler(NodeHandler):
                 'class': "receipt"
             })
 
+        if node['participant'] is not None:
+            ackNode['participant'] = node['participant']
+
         if node['type'] is not None:
             ackNode['type'] = node['type']
 
-        conn.sendMessageNode(ackNode)
+        try:
+            conn.sendMessageNode(ackNode)
+        finally: # ??? Is this necessary?
+            conn.fire("receipt", conn, node)
 
 
 class AckHandler(NodeHandler):
 
     def handleNode(self, conn, node):
-        selfJid = conn.deviceJid
-
-        if selfJid == node['from'] and node['class'] == "receipt" and node['type'] == "peer_msg":
-            conn.sendMessageNode(Node(
-                "receipt", {
-                    'to': selfJid,
-                    'type': "hist_sync",
-                    'id': node['id']
-                }))
-
-        elif node['class'] == "message":
-            pending = self.getPendingRequestDeferred(conn, node['id'])
-            if pending:
-                pending.callback(node)
+        pending = self.getPendingRequestDeferred(conn, node['id'])
+        if pending:
+            pending.callback(node)

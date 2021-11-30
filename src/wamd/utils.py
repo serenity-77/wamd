@@ -22,7 +22,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from io import BytesIO
 from PIL import Image
 
-from .coder import decodeInt
 from .errors import InvalidMediaSignature
 from .constants import Constants
 
@@ -31,14 +30,14 @@ _CRYPTO_BACKEND = default_backend()
 
 
 def generateRandomNumber(length=32):
-    s = str(decodeInt(os.urandom(2), 2))
+    s = str(decodeUint(os.urandom(2), 2))
     len_s = len(s)
 
     if len_s >= length:
         return s[:length]
 
     while len_s < length:
-        r = str(decodeInt(os.urandom(2), 2))
+        r = str(decodeUint(os.urandom(2), 2))
         s += r[:length - len_s]
         len_s = len(s)
 
@@ -53,6 +52,11 @@ def toHex(data, upper=True):
         result = result.upper()
     return result
 
+
+def toCommaSeparatedNumber(data):
+    if not isinstance(data, bytes):
+        data = data.encode()
+    return ",".join([str(l) for l in data])
 
 def hmacValidate(signKey, hmacSignature, data, size=None):
     h = hmac.HMAC(signKey, hashes.SHA256(), backend=_CRYPTO_BACKEND)
@@ -382,3 +386,85 @@ class FFMPEGVideoAdapter:
         d.addErrback(errback)
 
         return deferred
+
+
+def decodeUint(value, length):
+    if not value:
+        return 0
+    v = value[:length]
+    if Constants.IS_LITTLE_ENDIAN:
+        v = v[::-1]
+    r = 0
+    for i in range(length):
+        r |= (v[i] << (i * 8))
+    return r
+
+
+def encodeUint(value, length):
+    t = []
+    for i in range(length):
+        shiftLength = i if not Constants.IS_LITTLE_ENDIAN else length - (i + 1)
+        t.append((value >> (shiftLength * 8)) & 0xFF)
+    return bytes(t)
+
+
+def buildJid(user, server, agent, device):
+    if not server:
+        raise ValueError("Server Required")
+    if user is None:
+        user = ""
+    jid = user
+    if agent:
+        jid = jid + "_" + str(agent)
+    if device:
+        jid = jid + ":" + str(device)
+    jid = jid + "@" + server
+    return jid
+
+
+_EMTPY_JID = (None, None, None, None)
+
+
+def splitJid(jid):
+    if not jid:
+        raise ValueError("Empty Jid")
+
+    try:
+        u, server = jid.split("@")
+    except ValueError:
+        raise ValueError("Invalid jid format: %s" % (jid, ))
+
+    try:
+        userAgent, device = u.split(":")
+    except ValueError:
+        return (u, None, None, server)
+
+    if device == "":
+        device = None
+
+    user, agent = _splitUserAgent(userAgent)
+
+    if agent == "":
+        agent = None
+
+    return (user, agent, device, server)
+
+
+def _splitUserAgent(userAgent):
+    try:
+        user, agent = userAgent.split("_")
+    except ValueError:
+        return (userAgent, None)
+
+    return (user, agent)
+
+
+def isJidSameUser(jid1, jid2):
+    jid1User, _, _, jid1Server = splitJid(jid1)
+    jid2User, _, _, jid2Server = splitJid(jid2)
+    return jid1User == jid2User
+
+
+def isGroupJid(jid):
+    user, _, _, server = splitJid(jid)
+    return "-" in user or server == "g.us"

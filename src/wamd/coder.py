@@ -1,6 +1,3 @@
-import sys
-import binascii
-
 import xml.etree.cElementTree as ET
 from xml.dom import minidom
 
@@ -8,6 +5,8 @@ from io import BytesIO
 
 from .tokendict import WASingleByteTokens, WADoubleByteTokens
 from .errors import StreamEndError
+from .utils import toHex, buildJid, splitJid
+
 
 class WATags:
     LIST_EMPTY      = 0
@@ -30,9 +29,6 @@ class WATags:
     @staticmethod
     def get(str):
         return WATags.__dict__[str]
-
-
-_IS_LITTLE_ENDIAN = sys.byteorder == "little"
 
 
 class WABinaryWriter:
@@ -68,7 +64,7 @@ class WABinaryWriter:
         self._writeChildren(node.content if node.content is not None else node.children)
 
     def _writeChildren(self, children):
-        if children is None:
+        if not children:
             return
 
         if isinstance(children, str):
@@ -184,28 +180,38 @@ class WABinaryWriter:
                 self._writeToken(index % 256)
         else:
             try:
-                user, server = tag.split("@", 1)
+                # user, server = tag.split("@", 1)
+                user, agent, device, server = splitJid(tag)
             except ValueError:
                 self._writeBytes(self._encodeString(tag), packed)
             else:
                 if server == "c.us":
                     server = "s.whatsapp.net"
-                if server == "s.whatsapp.net":
-                    self._writeJid(user, server)
+                if server == "s.whatsapp.net" or server == "g.us":
+                    self._writeJid(user, server, agent, device)
                 else:
-                    self._writeBytes(self.encodeString(tag), packed)
+                    self._writeBytes(self._encodeString(tag), packed)
 
     def _encodeString(self, s):
         if isinstance(s, str):
             return s.encode()
         return s
 
-    def _writeJid(self, user, server):
-        self._data.append(250)
+    def _writeJid(self, user, server, agent=None, device=None):
         if user is None:
             user = ""
+        hasAgentOrDevice = agent is not None or device is not None
+        if hasAgentOrDevice:
+            self._data.append(0xF7)
+            agent = int(agent) if agent is not None else 0
+            device = int(device) if device is not None else 0
+            self._data.append(agent)
+            self._data.append(device)
+        else:
+            self._data.append(250)
         self._writeString(user, True)
-        self._writeString(server)
+        if not hasAgentOrDevice:
+            self._writeString(server)
 
     def _tryPackAndWriteHeader(self, v, headerData):
         size = len(headerData)
@@ -520,10 +526,17 @@ class Node:
     getChilds = findChilds
 
     def hasContent(self):
-        return self.content is not Node or self.children is not None
+        return self.content is not None or self.children
 
     def getContent(self):
         return self.content
+
+    def removeChild(self, child, raiseException=True):
+        try:
+            self.children.remove(child)
+        except ValueError:
+            if raiseException:
+                raise ValueError("Child %s not found on this %s node" % (child.tag, self.tag))
 
     def _createRootElement(self):
         attrs = {}
@@ -538,7 +551,7 @@ class Node:
         if self.content is not None:
             content = self.content
             if isinstance(content, bytes):
-                content = binascii.hexlify(content).decode()
+                content = toHex(content)
             tagElement.text = content
 
         elif self.children is not None:
@@ -568,7 +581,7 @@ class Node:
         if self.content is not None:
             content = self.content
             if isinstance(content, bytes):
-                content = binascii.hexlify(content).decode()
+                content = toHex(content)
             s += content
 
         elif self.children is not None:
@@ -584,75 +597,6 @@ class Node:
         return self._toXmlString()
 
 
-def encodeInt(value, length):
-    t = []
-    for i in range(length):
-        shiftLength = i if not _IS_LITTLE_ENDIAN else length - (i + 1)
-        t.append((value >> (shiftLength * 8)) & 0xFF)
-    return bytes(t)
-
-
-def decodeInt(value, length):
-    if not value:
-        return 0
-    v = value[:length]
-    if _IS_LITTLE_ENDIAN:
-        v = v[::-1]
-    r = 0
-    for i in range(length):
-        r |= (v[i] << (i * 8))
-    return r
-
 
 def getNumValidKeys(obj):
 	return len(list(filter(lambda x: obj[x] is not None, list(obj.keys()))))
-
-
-def buildJid(user, server, agent, device):
-    if not server:
-        raise ValueError("Server Required")
-    if user is None:
-        user = ""
-    jid = user
-    if agent:
-        jid = jid + "_" + str(agent)
-    if device:
-        jid = jid + ":" + str(device)
-    jid = jid + "@" + server
-    return jid
-
-
-_EMTPY_JID = (None, None, None, None)
-
-
-def splitJid(jid):
-    if not jid:
-        return _EMTPY_JID
-
-    try:
-        u, server = jid.split("@")
-    except ValueError:
-        raise ValueError("Unsupported jid format: %s" % (jid, ))
-
-    try:
-        userAgent, device = u.split(":")
-    except ValueError:
-        return (u, None, None, server)
-
-    user, agent = _splitUserAgent(userAgent)
-    return (user, agent, device, server)
-
-
-def _splitUserAgent(userAgent):
-    try:
-        user, agent = userAgent.split("_")
-    except ValueError:
-        return (userAgent, None)
-
-    return (user, agent)
-
-
-def isJidSameUser(jid1, jid2):
-    jid1User, _, _, jid1Server = splitJid(jid1)
-    jid2User, _, _, jid2Server = splitJid(jid2)
-    return jid1User == jid2User

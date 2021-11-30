@@ -22,14 +22,15 @@ _INITIAL_ATTRIBUTES = [
     "advSecretKey",
     "me",
     "signalIdentity",
-    "signedDeviceIdentity"
+    "signedDeviceIdentity",
+    "syncedDevice"
 ]
 
 
 class AuthState:
 
     def __init__(self, init=True, store=None):
-        self.__dict__['_authState'] = {}
+        self._authState = {}
 
         if store is None:
             store = DefaultMemoryStore()
@@ -37,22 +38,19 @@ class AuthState:
             store.getIdentityKeyPair = lambda: self.identityKey
             store.getLocalRegistrationId = lambda: self.registrationId
 
-        self.__dict__['store'] = store
+        self.store = store
 
         if init:
             self._initKeys()
 
     def _initKeys(self):
-        self.identityKey = KeyHelper.generateIdentityKeyPair()
-        self.noiseKey = curve.Curve.generateKeyPair()
-        self.signedPrekey = KeyHelper.generateSignedPreKey(self.identityKey, 1)
-        self.registrationId = KeyHelper.generateRegistrationId()
-        self.advSecretKey = os.urandom(32)
-        self.nextPrekeyId = 1
-        self.serverHasPreKeys = False
-
-    def __setattr__(self, name, value):
-        self._setKeyValue(name, value)
+        self['identityKey'] = KeyHelper.generateIdentityKeyPair()
+        self['noiseKey'] = curve.Curve.generateKeyPair()
+        self['signedPrekey'] = KeyHelper.generateSignedPreKey(self.identityKey, 1)
+        self['registrationId'] = KeyHelper.generateRegistrationId()
+        self['advSecretKey'] = os.urandom(32)
+        self['nextPreKeyId'] = 1
+        self['serverHasPreKeys'] = False
 
     def __getattr__(self, name):
         try:
@@ -128,7 +126,10 @@ class AuthState:
                 'deviceSignature': base64.b64encode(self.signedDeviceIdentity['deviceSignature']).decode()
             }
 
-        store = self.__dict__['store']
+        if self.has("syncedDevice"):
+            jsonDict['syncedDevice'] = self['syncedDevice']
+
+        store = self.store
 
         if IJsonSerializable.providedBy(store):
             # TODO
@@ -153,7 +154,7 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState.identityKey = IdentityKeyPair(
+            authState['identityKey'] = IdentityKeyPair(
                 IdentityKey(djbec.DjbECPublicKey(base64.b64decode(identityKey['public']))),
                 djbec.DjbECPrivateKey(base64.b64decode(identityKey['private'])))
 
@@ -162,7 +163,7 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState.noiseKey = eckeypair.ECKeyPair(
+            authState['noiseKey'] = eckeypair.ECKeyPair(
                 djbec.DjbECPublicKey(base64.b64decode(noiseKey['public'])),
                 djbec.DjbECPrivateKey(base64.b64decode(noiseKey['private'])))
 
@@ -171,7 +172,7 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState.signedPrekey = SignedPreKeyRecord(
+            authState['signedPrekey'] = SignedPreKeyRecord(
                 _id=signedPrekey['id'],
                 timestamp=signedPrekey['timestamp'],
                 ecKeyPair=eckeypair.ECKeyPair(
@@ -185,21 +186,21 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState.registrationId = registrationId
+            authState['registrationId'] = registrationId
 
         try:
             advSecretKey = jsonDict.pop("advSecretKey")
         except KeyError:
             pass
         else:
-            authState.advSecretKey = base64.b64decode(advSecretKey)
+            authState['advSecretKey'] = base64.b64decode(advSecretKey)
 
         try:
             signalIdentity = jsonDict.pop("signalIdentity")
         except KeyError:
             pass
         else:
-            authState.signalIdentity = {
+            authState['signalIdentity'] = {
                 'identifier': signalIdentity['identifier'],
                 'identifierKey': base64.b64decode(signalIdentity['identifierKey'])
             }
@@ -209,12 +210,19 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState.signedDeviceIdentity = {
+            authState['signedDeviceIdentity'] = {
                 'details': base64.b64decode(signedDeviceIdentity['details']),
                 'accountSignature': base64.b64decode(signedDeviceIdentity['accountSignature']),
                 'accountSignatureKey': base64.b64decode(signedDeviceIdentity['accountSignatureKey']),
                 'deviceSignature': base64.b64decode(signedDeviceIdentity['deviceSignature'])
             }
+
+        try:
+            syncedDevice = jsonDict.pop("syncedDevice")
+        except KeyError:
+            pass
+        else:
+            authState['syncedDevice'] = syncedDevice
 
         if IJsonSerializable.providedBy(authState.store):
             try:
@@ -227,14 +235,14 @@ class AuthState:
                 authState.store.populate(jsonDictStore)
 
         for k, v in jsonDict.items():
-            setattr(authState, k, v)
+            authState[k] = v
 
         return authState
 
     def setStore(self, store):
-        self.__dict__['store'] = store
+        self.store = store
 
     def __repr__(self):
-        return "<%s Object at 0x%x %s>" % (qual(self.__class__), id(self), str(self.__dict__['_authState']))
+        return "<%s Object at 0x%x %s>" % (qual(self.__class__), id(self), str(self._authState))
 
     __str__ = __repr__

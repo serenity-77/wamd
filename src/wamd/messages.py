@@ -7,7 +7,12 @@ from twisted.python.reflect import qual
 
 from .proto import WAMessage_pb2
 from wamd.coder import Node
-from wamd.utils import protoMessageToJson, mediaTypeFromMime, jsonToProtoMessage
+from wamd.utils import (
+    protoMessageToJson,
+    mediaTypeFromMime,
+    jsonToProtoMessage,
+    isGroupJid
+)
 
 
 class WhatsAppMessage:
@@ -62,6 +67,9 @@ class WhatsAppMessage:
         else:
             o = "%sTo: %s\n" % (indent, self['to'])
 
+        if self['participant']:
+            o += "%sParticipant: %s\n" % (indent, self['participant'])
+
         if self['notify']:
             o += "%sNotify: %s\n" % (indent, self['notify'])
 
@@ -105,8 +113,8 @@ class WhatsAppMessage:
             if self['title'] is not None:
                 o += "%sTitle: %s\n" % (indent, self['title'][:self.__class__._TEXT_LIMIT] + "..." if len(self['title']) > self.__class__._TEXT_LIMIT else self['title'])
 
-        elif isinstance(self, UnknownMessage):
-            ignoreKeys = "from,to,notify,fromMe,id,messageTimestamp".split(",")
+        elif isinstance(self, ProtocolMessage):
+            ignoreKeys = "from,to,notify,fromMe,id,messageTimestamp,isRead,participant".split(",")
             for k, v in self._attrs.items():
                 if k not in ignoreKeys:
                     o += "%s%s: %s\n" % (indent, k.title(), str(v) if not isinstance(v, str) else v)
@@ -118,66 +126,53 @@ class WhatsAppMessage:
         return "3EB0" + binascii.hexlify(os.urandom(8)).decode().upper()
 
     @staticmethod
-    def fromMessageProto(messageProto, node=None, isRead=True):
-        webMessageInfoProto = messageProto
-
-        if isinstance(webMessageInfoProto, WAMessage_pb2.Message):
-            if node is None:
-                raise ValueError("Instance of %s required" % (qual(Node)))
-            messageKey = WAMessage_pb2.MessageKey()
-            messageKey.remoteJid = node['from']
-            messageKey.fromMe = False if node['fromMe'] is None else node['fromMe']
-            messageKey.id = node['id']
-            webMessageInfoProto = WAMessage_pb2.WebMessageInfo()
-            webMessageInfoProto.key.MergeFrom(messageKey)
-            webMessageInfoProto.message.MergeFrom(messageProto)
-            webMessageInfoProto.messageTimestamp = int(node['t'])
-
+    def fromWebMessageInfoProto(webMessageInfoProto, isRead=True):
         if not isinstance(webMessageInfoProto, WAMessage_pb2.WebMessageInfo):
-            raise ValueError("Must be an instance of WAMessage_pb2.WebMessageInfo")
+            raise ValueError("Must be an instance of %s" % qual(WAMessage_pb2.WebMessageInfo))
+
+        messageDict = protoMessageToJson(webMessageInfoProto)
+        messageKey = messageDict['key']
+        del messageDict['key']
+
+        try:
+            message = messageDict['message']
+            del messageDict['message']
+        except KeyError:
+            message = None
 
         attributes = {}
 
-        if webMessageInfoProto.key.fromMe:
-            attributes['to'] = webMessageInfoProto.key.remoteJid
+        if messageKey['fromMe']:
+            attributes['to'] = messageKey['remoteJid']
         else:
-            attributes['from'] = webMessageInfoProto.key.remoteJid
+            attributes['from'] = messageKey['remoteJid']
 
         attributes.update({
-            'fromMe': webMessageInfoProto.key.fromMe,
-            'id': webMessageInfoProto.key.id,
-            'messageTimestamp': webMessageInfoProto.messageTimestamp,
+            'fromMe': messageKey['fromMe'],
+            'id': messageKey['id'],
+            'messageTimestamp': messageDict['messageTimestamp'],
             'isRead': isRead
         })
 
-        if node is not None:
-            attributes['notify'] = node['notify']
-            if node['participant'] is not None:
-                attributes['participant'] = node['participant']
+        attributes.update(messageDict)
 
-        if webMessageInfoProto.HasField("message"):
-            if webMessageInfoProto.message.HasField("conversation"):
-                attributes['conversation'] = webMessageInfoProto.message.conversation
+        if message is not None:
+            if "conversation" in message:
+                attributes['conversation'] = message['conversation']
                 cls = TextMessage
             else:
                 for messageType, klass in _MESSAGE_TYPE_CLASS_MAPS.items():
-                    if webMessageInfoProto.message.HasField(messageType):
+                    if messageType in message:
                         if klass is not None:
-                            messageDict = protoMessageToJson(getattr(webMessageInfoProto.message, messageType))
-                            attributes.update(messageDict)
+                            attributes.update(message[messageType])
                             if messageType in _SUPPORTED_MEDIA_KEYS:
-                                attributes['mediaType'] = mediaTypeFromMime(messageDict['mimetype'])
+                                attributes['mediaType'] = mediaTypeFromMime(message[messageType]['mimetype'])
                             cls = klass
                         else:
                             raise NotImplementedError("Message Type [%s] Not Implemented" % (messageType, ))
 
         else:
-            del attributes['isRead']
-            messageDict = protoMessageToJson(webMessageInfoProto)
-            for k, v in messageDict.items():
-                if k != "key":
-                    attributes[k] = v
-            cls = UnknownMessage
+            cls = ProtocolMessage
 
         return cls(**attributes)
 
@@ -231,7 +226,7 @@ class TemplateMessage(WhatsAppMessage):
     pass
 
 
-class UnknownMessage(WhatsAppMessage):
+class ProtocolMessage(WhatsAppMessage):
     pass
 
 

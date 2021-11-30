@@ -7,6 +7,5 @@ class FailureHandler(NodeHandler):
 
     def handleNode(self, conn, node):
         if not conn._authDone():
-            conn._handleFailure(Failure(
-                AuthenticationFailedError(
-                    "Authentication Failed: %s" % (node['reason']))))
+            raise AuthenticationFailedError(
+                "Authentication Failed: %s" % (node['reason']))

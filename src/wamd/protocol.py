@@ -16,6 +16,7 @@ from twisted.python.reflect import qual
 from twisted.logger import Logger
 
 from autobahn.twisted.websocket import WebSocketClientProtocol, WebSocketClientFactory
+from autobahn.websocket.protocol import WebSocketProtocol
 
 from dissononce.processing.impl.handshakestate import HandshakeState
 from dissononce.processing.impl.cipherstate import CipherState
@@ -38,20 +39,22 @@ from axolotl.identitykey import IdentityKey
 from .constants import Constants
 from .common import AuthState
 from .errors import (
-    ConnectionClosedError,
+    ConnectionClosed,
     AuthenticationFailedError,
     StreamEndError,
     NodeStreamError,
-    SendMessageError
+    SendMessageError,
+    WAMDError
 )
-from .coder import (
-    encodeInt, decodeInt, WABinaryReader, WABinaryWriter,
-    splitJid, Node
-)
+from .coder import WABinaryReader, WABinaryWriter, Node
 
 from .utils import (
+    encodeUint,
+    decodeUint,
+    splitJid,
+    isJidSameUser,
     generateRandomNumber,
-    toHex,
+    toCommaSeparatedNumber,
     inflate,
     sha256Hash,
     mimeTypeFromBuffer,
@@ -61,18 +64,18 @@ from .utils import (
     addRandomPadding,
     FFMPEGVideoAdapter
 )
-from .handlers import createNodeHander
+from .handlers import createNodeHandler
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import WhatsAppMessage, TextMessage, MediaMessage
 from .signalhelper import processPreKeyBundle, encrypt as signalEncrypt
 from .http import request as doHttpRequest
+from .common import AuthState
+
+_VALID_EVENTS = ["qr", "close", "inbox", "receipt"]
 
 
-_VALID_EVENTS = ["open", "qr", "close", "inbox", "ack"]
-
-
-class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
+class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     log = Logger() # set your own logger instance
 
@@ -83,7 +86,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
     _serverHelloDeferred = None
 
-    def __init__(self, authState=None, useSentQueue=False, reactor=None):
+    def __init__(self, authState, useSentQueue=False, reactor=None):
         WebSocketClientProtocol.__init__(self)
 
         validEvents = [] if self._valid_events is None else self._valid_events.copy()
@@ -99,23 +102,26 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         self.reactor = reactor
 
         self._pendingRequest = {}
-        self._nodeHandlers = {}
-        self._cachedMedia = {}
 
+        # For now this will be here
+        # but in the future it will be stored at
+        # self.authState.store
+        self._cachedMedia = {}
+        self._pendingRetryMessage = {}
 
     def onOpen(self):
-        self.log.info("Connected to whatsapp server")
-        if self.authState is None:
-            self.fire("open", self)
-        else:
-            self._doHandshake().addErrback(self._handleFailure)
+        self.log.info("Connected to whatsapp server: {peer}", peer=self.transport.getPeer())
+        self.factory._onOpen(self)
 
     def onClose(self, wasClean, code, reason):
         self.log.info("Connection Closed: wasClean: {wasClean}, code: {code}, reason: {reason}",
             wasClean=wasClean, code=code, reason=reason)
 
-        if self._keepAliveLoop is not None and self._keepAliveLoop.running:
-            self._keepAliveLoop.stop()
+        if self._keepAliveLoop is not None:
+            try:
+                self._keepAliveLoop.stop()
+            except:
+                pass
             self._keepAliveLoop = None
 
         if self._failure is not None:
@@ -123,25 +129,27 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         else:
             failure = None
 
-        if failure is not None and self.factory.authDeferred is not None:
-            self.factory.authFailure(failure)
-        else:
-            # TODO
-            # 1.do not fire "close" event when restarting connection
-            #   after authentication success.
-            # 2. Handle error when device is scanned using non md device
+        # do not fire "close" event when restarting connection
+        # after authentication success.
 
-            if failure is None:
-                excReason = ConnectionClosedError(reason="Connection Closed Cleanly")
-            elif isinstance(failure.value, NodeStreamError):
-                if failure.value.code == "401":
-                    excReason = ConnectionClosedError(isLoggedOut=True, reason="Logged Out")
-                else:
-                    excReason = ConnectionClosedError(reason="Unhandled Stream Error")
-            elif isinstance(failure.value, AuthenticationFailedError):
-                excReason = ConnectionClosedError(isAuthDone=False, reason="Authentication Failed")
+        if not self._authDone():
+            self._stopQrLoop()
+
+            if self.factory.readyDeferred is not None:
+                self.factory._onClose(self)
             else:
-                excReason = ConnectionClosedError(reason="Unknown Failure: \n%s" % (str(failure)))
+                if self.factory._authState is None:
+                    if failure is None:
+                        failure = AuthenticationFailedError("Connection is closed during authentication")
+                    self.factory.authFailure(failure)
+        else:
+            if failure is not None and isinstance(failure.value, NodeStreamError):
+                if failure.value.code == "401":
+                    excReason = ConnectionClosed(isLoggedOut=True, reason="Connection Closed Cleanly (Logged Out)")
+                else:
+                    excReason = ConnectionClosed(reason="Unhandled Stream Error, Code: %s" % (failure.value))
+            else:
+                excReason = ConnectionClosed(reason="Connection Closed Cleanly")
 
             self.fire("close", self, Failure(excReason))
 
@@ -149,7 +157,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         return self.factory.authDeferred is None
 
     def onMessage(self, message, isBinary):
-        self.log.debug("OnMessage Received [{message}]", message=toHex(message))
+        self.log.debug("OnMessage Received [{message}]\n", message=toCommaSeparatedNumber(message))
 
         # TODO
         # Handle close message (b'\x88\x02\x03\xf3')
@@ -162,19 +170,19 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             d.callback(serverHello)
         else:
             while message:
-                messageLength = decodeInt(message[:3], 3)
+                messageLength = decodeUint(message[:3], 3)
                 encrypted = message[3:messageLength + 3]
                 message = message[messageLength + 3:]
 
-                self.log.debug("OnMessage, Encrypted: [{encrypted}]", encrypted=toHex(encrypted))
+                self.log.debug("OnMessage, Encrypted: [{encrypted}]\n", encrypted=toCommaSeparatedNumber(encrypted))
 
                 if self._recvCipher is not None:
                     try:
                         decrypted = self._recvCipher.decrypt_with_ad(b"", encrypted)
                     except:
-                        self._handleFailure(Failure())
+                        self.log.failure("Noise Decrypt Failed")
                     else:
-                        self.log.debug("OnMessage, Decrypted: [{decrypted}]", decrypted=toHex(decrypted))
+                        self.log.debug("OnMessage, Decrypted: [{decrypted}]\n", decrypted=toCommaSeparatedNumber(decrypted))
 
                         try:
                             if decrypted[0] & Constants.FLAG_COMPRESSED:
@@ -183,7 +191,8 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                                 decrypted = decrypted[1:]
                             node = WABinaryReader(decrypted).readNode()
                         except StreamEndError:
-                            pass
+                            self._streamEndReceived = True
+                            self._clearTransportCipher()
                         else:
                             self.messageNodeReceived(node)
 
@@ -200,12 +209,19 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         if isinstance(failure, Exception):
             failure = Failure(failure)
 
-        self.log.error("Handle Failure: {failure}", failure=failure)
+        self.log.failure("Handle Failure", failure=failure)
 
-        if not self._authDone():
+        if not self._authDone() or isinstance(failure.value, NodeStreamError):
             self._failure = failure
-            self._sendCipher = None
-            self._recvCipher = None
+
+        if isinstance(failure.value, AuthenticationFailedError):
+            # The server does not send xmlstreamend after sending
+            # failure node. (<failure reason="401" location="vll"></failure>)
+            self._clearTransportCipher()
+
+    def _clearTransportCipher(self):
+        self._sendCipher = None
+        self._recvCipher = None
 
     @inlineCallbacks
     def _doHandshake(self):
@@ -264,7 +280,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         self.log.debug("Client Finish: {clientFinish}", clientFinish=handshakeMsg)
 
         clientFinishMessage = handshakeMsg.SerializeToString()
-        clientFinishPayload = encodeInt(len(clientFinishMessage), 3) + clientFinishMessage
+        clientFinishPayload = encodeUint(len(clientFinishMessage), 3) + clientFinishMessage
 
         self.sendMessage(clientFinishPayload, isBinary=True)
 
@@ -277,9 +293,6 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         return self._serverHelloDeferred
 
     def _sendClientHello(self):
-        if self.authState is None:
-            self.authState = AuthState()
-
         # Noise Initialization Noise_XX_25519_AESGCM_SHA256
         # ('e',),
         # ('e', 'ee', 's', 'es'),
@@ -309,14 +322,12 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         clientHello = WAMessage_pb2.ClientHello()
         clientHello.ephemeral = bytes(ephemeralPublic)
 
-        handshakeMsg = WAMessage_pb2.HandshakeMessage(
-            clientHello=clientHello
-        )
+        handshakeMsg = WAMessage_pb2.HandshakeMessage(clientHello=clientHello)
 
         self.log.debug("ClientHello: {handshakeMsg}", handshakeMsg=handshakeMsg)
 
         clientHelloMsg = handshakeMsg.SerializeToString()
-        clientHelloPayload = bytes(Constants.PROLOGUE) + encodeInt(len(clientHelloMsg), 3) + clientHelloMsg
+        clientHelloPayload = bytes(Constants.PROLOGUE) + encodeUint(len(clientHelloMsg), 3) + clientHelloMsg
 
         self.sendMessage(clientHelloPayload, True)
 
@@ -345,10 +356,10 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             companionProps.requireFullSync = False
 
             companionRegData.companionProps = companionProps.SerializeToString()
-            companionRegData.eRegid = encodeInt(self.authState.registrationId, 4)
-            companionRegData.eKeytype = encodeInt(5, 1)
+            companionRegData.eRegid = encodeUint(self.authState.registrationId, 4)
+            companionRegData.eKeytype = encodeUint(5, 1)
             companionRegData.eIdent = self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()
-            companionRegData.eSkeyId = encodeInt(self.authState.signedPrekey.getId(), 3)
+            companionRegData.eSkeyId = encodeUint(self.authState.signedPrekey.getId(), 3)
             companionRegData.eSkeyVal = self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()
             companionRegData.eSkeySig = self.authState.signedPrekey.getSignature()
 
@@ -367,7 +378,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
         userAgent = WAMessage_pb2.UserAgent()
         userAgent.appVersion.MergeFrom(userAgentAppVersion)
-        userAgent.platform = 14
+        userAgent.platform = WAMessage_pb2.UserAgent.WEB
         userAgent.releaseChannel = 0
         userAgent.mcc = "000"
         userAgent.mnc = "000"
@@ -393,7 +404,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         nodeHandler = None
 
         try:
-            nodeHandler = createNodeHander(node.tag, self.reactor)
+            nodeHandler = createNodeHandler(node.tag, self.reactor)
         except:
             # TODO
             # handle failure when login
@@ -412,20 +423,40 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             self._handleFailure(Failure())
 
 
+    _streamEndReceived = False
+
+    @property
+    def isClosingOrClosed(self):
+        return (
+            self.state == WebSocketProtocol.STATE_CLOSING or
+            self.state == WebSocketProtocol.STATE_CLOSED or
+            self._streamEndReceived)
+
     def sendMessageNode(self, node):
+        if self.isClosingOrClosed:
+            raise WAMDError("Websocket is closing or closed")
+
         self.log.debug("Message Node:\n\n{node}\n", node=node)
+
         encoded = b"\x00" + WABinaryWriter(node).getData()
-        self.log.debug("Message Node Encoded: [{encoded}]", encoded=toHex(encoded))
+        self.log.debug("Message Node Encoded: [{encoded}]\n", encoded=toCommaSeparatedNumber(encoded))
+
         encrypted = self._sendCipher.encrypt_with_ad(b"", encoded)
-        self.log.debug("Message Node Encrypted: [{encrypted}]", encrypted=toHex(encrypted))
-        payload = encodeInt(len(encrypted), 3) + encrypted
-        self.log.debug("Message Payload: [{payload}]", payload=toHex(payload))
+        self.log.debug("Message Node Encrypted: [{encrypted}]\n", encrypted=toCommaSeparatedNumber(encrypted))
+
+        payload = encodeUint(len(encrypted), 3) + encrypted
+        self.log.debug("Message Payload: [{payload}]\n", payload=toCommaSeparatedNumber(payload))
+
         self.sendMessage(payload, isBinary=True)
 
     def request(self, node):
         deferred = Deferred()
-        self._pendingRequest[node['id']] = deferred
-        self.sendMessageNode(node)
+        try:
+            self.sendMessageNode(node)
+        except:
+            deferred.errback(Failure())
+        else:
+            self._pendingRequest[node['id']] = deferred
         return deferred
 
     _deviceJid = None
@@ -438,17 +469,41 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         return self._deviceJid
 
     def sendReadReceipt(self, message):
-        try:
+        if message['fromMe'] or isJidSameUser(message['from'], self.authState.me['jid']):
+            return fail(WAMDError("Cannot Send Read Receipt To Our Own Device"))
+
+        receiptNode = Node("receipt", {
+            'to': message['from'],
+            'type': "read",
+            'id': message['id'],
+            't': str(int(time.time()))
+        })
+
+        if message['participant'] is not None:
+            receiptNode['participant'] = message['participant']
+
+        return self.request(receiptNode)
+
+    def disconnectFromServer(self, logout=False):
+        if logout:
             self.sendMessageNode(Node(
-                "receipt", {
-                    'to': message['from'],
-                    'type': "read",
-                    'id': message['id'],
-                    't': str(int(time.time()))
-                }))
-        except:
-            return fail(Failure())
-        return succeed(None)
+                "iq", {
+                    'to': Constants.S_WHATSAPP_NET,
+                    'type': "set",
+                    'id': self._generateMessageId(),
+                    'xmlns': "md"
+                }, Node("remove-companion-device", {
+                    'jid': self.authState.me['jid'],
+                    'reason': "user_initiated"
+                })
+            ))
+
+            self._handleFailure(NodeStreamError("401"))
+
+        # self.reactor.callLater(0, lambda: self.sendClose(code=1000))
+        # want to use self.sendClose, but it seems that the server
+        # is the only one who can close the connection.
+        self._sendStreamEnd()
 
     def sendMsg(self, message):
         # TODO
@@ -676,9 +731,6 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
     @inlineCallbacks
     def _createParticipantsForMessage(self, message):
-        destUser, destServer = message['to'].split("@")
-        meUser, meServer = self.deviceJid.split("@")
-
         messageProto = message.toProtobufMessage()
 
         deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
@@ -688,40 +740,49 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
         deviceMessageProto = WAMessage_pb2.Message()
         deviceMessageProto.deviceSentMessage.MergeFrom(deviceSentMessageProto)
 
-        sessionExists = yield maybeDeferred(self.authState.store.containSession, destUser, 1)
-        sessionMeExists = yield maybeDeferred(self.authState.store.containSession, meUser, 1)
+        messageRecipients = [message['to']]
+
+        if self.authState.has("syncedDevice") and self.authState.syncedDevice['devices']:
+            for jid in self.authState.syncedDevice['devices']:
+                messageRecipients.append(jid)
+        else:
+            # this means only our own device and destination
+            messageRecipients.append(self.deviceList)
 
         keyRequestJids = []
-        if not sessionExists:
-            keyRequestJids.append(message['to'])
-
-        if not sessionMeExists:
-            keyRequestJids.append(self.deviceJid)
+        for fullJid in messageRecipients:
+            if not (yield maybeDeferred(
+                self.authState.store.containSession, fullJid.split("@")[0], 1)
+            ):
+                keyRequestJids.append(fullJid)
 
         if keyRequestJids:
             preKeyBundles = yield self._requestPreKeyBundles(keyRequestJids)
 
-            for jid, preKeyBundle in preKeyBundles.items():
-                yield processPreKeyBundle(self.authState.store, preKeyBundle, jid.split("@")[0])
+            for fullJid, preKeyBundle in preKeyBundles.items():
+                yield processPreKeyBundle(self.authState.store, preKeyBundle, fullJid.split("@")[0])
 
-        destType, destCipherText = yield signalEncrypt(
-            self.authState.store,
-            addRandomPadding(messageProto.SerializeToString()),
-            destUser)
+        participantsNode = Node("participants")
 
-        destEncNode = Node("enc", {'v': "2", 'type': destType}, destCipherText)
+        for toJid in messageRecipients:
+            if toJid == message['to']:
+                paddedMessage = addRandomPadding(messageProto.SerializeToString())
+            else:
+                paddedMessage = addRandomPadding(deviceMessageProto.SerializeToString())
 
-        deviceType, deviceCipherText = yield signalEncrypt(
-            self.authState.store,
-            addRandomPadding(deviceMessageProto.SerializeToString()),
-            meUser)
+            type, cipherText = yield signalEncrypt(
+                self.authState.store, paddedMessage, toJid.split("@")[0])
 
-        deviceEncNode = Node("enc", {'v': "2", 'type': deviceType}, deviceCipherText)
-
-        participantsNode = Node("participants", None, [
-            Node("to", {'jid': message['to']}, destEncNode),
-            Node("to", {'jid': self.deviceJid}, deviceEncNode)
-        ])
+            participantsNode.addChild(Node(
+                "to", {
+                    'jid': toJid
+                }, Node(
+                    'enc', {
+                        'v': "2",
+                        'type': type
+                    }, cipherText
+                )
+            ))
 
         return participantsNode
 
@@ -754,13 +815,13 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
             preKeyNode = userNode.findChild("key")
             # TODO
             # handle if preKeyNode is None
-            registrationId = decodeInt(userNode.findChild("registration").content, 4)
+            registrationId = decodeUint(userNode.findChild("registration").content, 4)
             identityKey = IdentityKey(djbec.DjbECPublicKey(userNode.findChild("identity").content))
-            signedPreKeyId = decodeInt(signedPreKeyNode.findChild("id").content, 3)
+            signedPreKeyId = decodeUint(signedPreKeyNode.findChild("id").content, 3)
             signedPreKeyPublic = djbec.DjbECPublicKey(signedPreKeyNode.getChild("value").content)
             signedPreKeySignature = signedPreKeyNode.getChild("signature").content
 
-            preKeyId = decodeInt(preKeyNode.findChild("id").getContent(), 3)
+            preKeyId = decodeUint(preKeyNode.findChild("id").getContent(), 3)
             preKeyPublic = djbec.DjbECPublicKey(preKeyNode.getChild("value").content)
 
             preKeyBundles[userNode['jid']] = PreKeyBundle(
@@ -786,14 +847,14 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
     @inlineCallbacks
     def _uploadPreKeys(self, count=None):
-        nextPrekeyId = self.authState.nextPrekeyId
+        nextPreKeyId = self.authState.nextPreKeyId
 
         self.log.debug("Uploading Prekeys")
 
         if count is None:
-            count = 30 # whatsapp web send 30
+            count = Constants.MAX_PREKEYS_UPLOAD # whatsapp web send 30
 
-        preKeys = KeyHelper.generatePreKeys(nextPrekeyId, count)
+        preKeys = KeyHelper.generatePreKeys(nextPreKeyId, count)
         maxPreKeyId = max([key.getId() for key in preKeys])
 
         preKeysContent = []
@@ -804,7 +865,7 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                     self.authState.store.storePreKey, preKey.getId(), preKey)
                 preKeysContent.append(
                     Node("key", None, [
-                        Node("id", None, encodeInt(preKey.getId(), 3)),
+                        Node("id", None, encodeUint(preKey.getId(), 3)),
                         Node("value", None, preKey.getKeyPair().getPublicKey().getPublicKey())
                     ]))
             except:
@@ -819,33 +880,82 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                 'type': "set",
                 'to': Constants.S_WHATSAPP_NET
             }, content=[
-                Node("registration", None, encodeInt(self.authState.registrationId, 4)),
-                Node("type", None, encodeInt(curve.Curve.DJB_TYPE, 1)),
+                Node("registration", None, encodeUint(self.authState.registrationId, 4)),
+                Node("type", None, encodeUint(curve.Curve.DJB_TYPE, 1)),
                 Node("identity", None, self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
                 Node("list", None, preKeysContent),
                 Node("skey", None, [
-                    Node("id", None, encodeInt(self.authState.signedPrekey.getId(), 3)),
+                    Node("id", None, encodeUint(self.authState.signedPrekey.getId(), 3)),
                     Node("value", None, self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()),
                     Node("signature", None, self.authState.signedPrekey.getSignature())
                 ])
             ]))
 
-        self.authState.nextPrekeyId = maxPreKeyId + 1
+        self.authState['nextPreKeyId'] = maxPreKeyId + 1
 
-    def _sendRetryRequest(self, messageNode):
+    def _sendRetryReceiptRequest(self, messageNode):
         retryCount = messageNode.findChild("enc")['count']
 
         if retryCount is not None:
-            retryCount = str(int(retryCount) + 1)
+            retryCount = int(retryCount) + 1
         else:
-            retryCount = "1"
+            retryCount = 1
 
-        self.request(Node(
+        receiptNode = Node("receipt", {
+            'id': messageNode['id'],
+            'to': messageNode['from'],
+            'type': "retry"
+        })
+
+        if node['participant'] is not None:
+            receiptNode['participant'] = node['participant']
+
+        receiptNode.addChild(Node(
+            "retry", {
+                'v': "1",
+                'count': str(retryCount),
+                'id': node['id'],
+                't': str(int(time.time()))
+            }
+        ))
+
+        if retryCount > 1:
+            receiptNode.addChild(Node(
+                "registration", Node, encodeUint(self.authState.registrationId)
+            ))
+
+            preKey = KeyHelper.generatePreKeys(self.authState.nextPreKeyId, 1)[0]
+            self.authState['nextPreKeyId'] += 1
+
+            receiptNode.addChild(Node(
+                "keys", None, [
+                    Node("type", None, encodeUint(curve.Curve.DJB_TYPE)),
+                    Node("identity", None, self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
+                    Node("key", None, [
+                        Node("id", None, encodeUint(preKey.getId())),
+                        Node("value", preKey.getKeyPair().getPublicKey().getPublicKey())
+                    ]),
+                    Node("skey", None, [
+                        Node("id", None, encodeUint(self.authState.signedPrekey.getId(), 3)),
+                        Node("value", None, self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()),
+                        Node("signature", None, self.authState.signedPrekey.getSignature())
+                    ]),
+                    self._buildDeviceIdentityNode()
+                ]
+            ))
+
+        def errback(f):
+            # Retry again maybe?
+            # Or if it is caused by connection Lost then how?
+            self.log.failure("Send Retry Receipt Failed", failure=f)
+            self.authState['nextPreKeyId'] -= 1
+            return f
+
+        return self.request(Node(
             "receipt", {
                 'id': messageNode['id'],
-                'type': "retry",
                 'to': messageNode['from'],
-                't': messageNode['t']
+                'type': "retry"
             }, [
                 Node("retry", {
                     'count': retryCount,
@@ -853,16 +963,21 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
                     'v': "1",
                     't': messageNode['t']
                 }),
-                Node("registration", None, encodeInt(self.authState.registrationId, 4))
+                Node("registration", None, encodeUint(self.authState.registrationId, 4))
             ]
-        ))
+        )).addErrback(errback)
 
-    def _restart(self):
+
+    def _authOK(self):
         self.log.info("Authentication Success, Restarting Connection")
         self.factory._authState = self.authState
         self.authState = None
-        self._sendCipher = None
-        self._recvCipher = None
+        self._clearTransportCipher()
+
+    def _sendStreamEnd(self):
+        if not self._streamEndReceived:
+            self.sendMessageNode(Node("xmlstreamend"))
+            self._clearTransportCipher()
 
     _keepAliveLoop = None
 
@@ -880,6 +995,55 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
 
         self._keepAliveLoop = loop
         self._keepAliveLoop.start(20, now=False)
+
+    _qrDelayedCall = None
+
+    def _startQrLoop(self, qrRefs):
+        initial = [True]
+
+        def resetDelayedCall():
+            self._qrDelayedCall = None
+            emitQR()
+
+        def emitQR():
+            try:
+                qrRef = qrRefs.pop(0)
+            except IndexError:
+                try:
+                    raise AuthenticationFailedError("QR Timeout")
+                except:
+                    self._sendStreamEnd()
+                    self._handleFailure(Failure())
+            else:
+                if initial[0]:
+                    initial[0] = False
+                    timeout = 57
+                else:
+                    timeout = 18
+
+                qrInfo = [
+                    qrRef,
+                    base64.b64encode(self.authState.noiseKey.getPublicKey().getPublicKey()),
+                    base64.b64encode(self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
+                    base64.b64encode(self.authState.advSecretKey)
+                ]
+
+                self.fire("qr", qrInfo).addErrback(evErrback)
+                self._qrDelayedCall = self.reactor.callLater(timeout, resetDelayedCall)
+
+        def evErrback(f):
+            self._sendStreamEnd()
+            self._handleFailure(f)
+
+        emitQR()
+
+    def _stopQrLoop(self):
+        if self._qrDelayedCall is not None:
+            try:
+                self._qrDelayedCall.cancel()
+            except:
+                pass
+            self._qrDelayedCall = None
 
     _messageTagCounter = 0
     _messageTagPrefix = None
@@ -910,10 +1074,14 @@ class MultiDeviceWhatsAppClientProtocol(WebSocketClientProtocol):
     def _maybeSaveCachedMedia(self, cachedKey, mediaData):
         self._cachedMedia[cachedKey] = mediaData
 
+    def _savePendingRetryMessage(self, key, message):
+        pass
+
 
 class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):
 
     _authState = None
+    _savedProtocol = None
 
     def __init__(self,
         url=None,
@@ -931,24 +1099,30 @@ class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):
 
     def buildProtocol(self, addr):
         protocol = self.protocol()
+
         if self._authState is not None:
             authState, self._authState = self._authState, None
+            if protocol.authState is not None:
+                protocol.authState = None
             protocol.authState = authState
+
         protocol.factory = self
-        protocol.on("open", self._onOpen)
-        protocol.on("close", self._onClose)
+
         return protocol
 
     def _onOpen(self, connection):
         if self.readyDeferred is not None:
             d, self.readyDeferred = self.readyDeferred, None
             d.callback(connection)
+        else:
+            # handshake after authetication success
+            connection._doHandshake().addErrback(connection._handleFailure)
 
     def _onClose(self, connection, reason=None):
         if self.readyDeferred is not None:
             d, self.readyDeferred = self.readyDeferred, None
             if reason is None:
-                reason = ConnectionClosedError(reason="Websocket Handshake Failed")
+                reason = ConnectionClosed(reason="Websocket Handshake Failed")
             d.errback(reason)
 
     def authFailure(self, failure):
@@ -972,6 +1146,7 @@ class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):
 
 
 
+
 def connectToWhatsAppServer(
     protocolFactory=None,
     host=Constants.WHATSAPP_WEBSOCKET_HOST,
@@ -987,10 +1162,14 @@ def connectToWhatsAppServer(
     factory = MultiDeviceWhatsAppClientFactory(
         url=url,
         useragent=useragent,
-        origin=origin
-    )
+        origin=origin)
+
     if protocolFactory is None:
-        protocolFactory = MultiDeviceWhatsAppClientProtocol
+        def _protocolFactory():
+            authState = AuthState()
+            return MultiDeviceWhatsAppClient(authState)
+        protocolFactory = _protocolFactory
+
     factory.protocol = protocolFactory
 
     if host == Constants.WHATSAPP_WEBSOCKET_HOST:

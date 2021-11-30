@@ -1,43 +1,50 @@
-class WhatsAppError(Exception):
+class WAMDError(Exception):
     pass
 
-class ConnectionClosedError(WhatsAppError):
+class ConnectionClosed(WAMDError):
 
-    def __init__(self, isLoggedOut=False, isAuthDone=True, reason=""):
+    def __init__(self, isLoggedOut=False, reason=""):
         self.isLoggedOut = isLoggedOut
-        self.isAuthDone = isAuthDone
-        WhatsAppError.__init__(self, reason)
+        WAMDError.__init__(self, reason)
 
 
-class AuthenticationFailedError(WhatsAppError):
+class AuthenticationFailedError(WAMDError):
     pass
 
-class StreamEndError(WhatsAppError):
-    pass
-
-
-class HandlerNotFound(WhatsAppError):
+class StreamEndError(WAMDError):
     pass
 
 
-class HttpRequestError(WhatsAppError):
+class HandlerNotFound(WAMDError):
+    pass
+
+
+class HttpRequestError(WAMDError):
 
     def __init__(self, code, phrase, content):
         self.code = code
         self.content = content
-        WhatsAppError.__init__(self, phrase)
+        WAMDError.__init__(self, phrase)
 
 
-class InvalidMediaSignature(WhatsAppError):
+class InvalidMediaSignature(WAMDError):
     pass
 
 
-class NodeStreamError(WhatsAppError):
-    def __init__(self, code, message=""):
+class NodeStreamError(WAMDError):
+    def __init__(self, code=None, message=""):
         self.code = code
-        WhatsAppError.__init__(self, "StreamError: %s" % (self.code, ))
+        if self.code is not None:
+            m = "Stream Error: %s" % (self.code)
+        else:
+            m = message
+        WAMDError.__init__(self, m)
 
 
 
-class SendMessageError(WhatsAppError):
+class SendMessageError(WAMDError):
+    pass
+
+
+class IqRequestError(WAMDError):
     pass

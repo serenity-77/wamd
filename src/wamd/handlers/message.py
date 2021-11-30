@@ -1,4 +1,4 @@
-from twisted.internet.defer import inlineCallbacks
+from twisted.internet.defer import inlineCallbacks, succeed, maybeDeferred
 from twisted.python.failure import Failure
 
 from axolotl.invalidkeyidexception import InvalidKeyIdException
@@ -6,10 +6,19 @@ from axolotl.invalidmessageexception import InvalidMessageException
 from axolotl.duplicatemessagexception import DuplicateMessageException
 
 from .base import NodeHandler
-from wamd.coder import splitJid, Node, isJidSameUser
-from wamd.signalhelper import decrypt as signalDecrypt
+from wamd.coder import Node
+from wamd.signalhelper import (
+    decrypt as signalDecrypt,
+    processSenderKeyDistributionMessage
+)
 from wamd.proto import WAMessage_pb2
-from wamd.utils import toHex, inflate, removeRandomPadding
+from wamd.utils import (
+    toCommaSeparatedNumber,
+    inflate,
+    removeRandomPadding,
+    isJidSameUser,
+    isGroupJid
+)
 from wamd.http import downloadMediaAndDecrypt
 from wamd.messages import WhatsAppMessage
 
@@ -22,7 +31,7 @@ class MessageHandler(NodeHandler):
     	    <verified_name v="1" verified_level="unknown">0a2208e2e7bfa2a2c7be8a6f1206736d623a7761220e48617269616e6a61204c756e647512409972c74e0e7400f89ea4fbe0cb8f2eeb927ef15bdc734329cc48d2af398877fe08a5e516a00a990074e3ff8abb11e844e1839537a419a626cac1c5e1f65a960b</verified_name>
     	</message>
 
-        conversation: "the message here"
+        conversation: "serenity"
         messageContextInfo {
           deviceListMetadata {
             recipientKeyHash: "\341An\307l\021\215\336\251\365"
@@ -39,17 +48,27 @@ class MessageHandler(NodeHandler):
     @inlineCallbacks
     def handleNode(self, conn, node):
         encNode = node.findChild("enc")
-        user, _, _, server = splitJid(node['from'])
 
         if encNode is None:
             # Unavailable content
             return
 
+        if encNode['type'] != "skmsg":
+            if node['participant'] is not None:
+                recipientId = node['participant'].split("@")[0]
+            else:
+                recipientId = node['from'].split("@")[0]
+            groupId = None
+        else:
+            recipientId = node['participant'].split("@")[0]
+            groupId = node['from'].split("@")[0]
+
         try:
             plainText = yield signalDecrypt(
                 conn.authState.store,
                 encNode.content,
-                user,
+                recipientId,
+                groupId=groupId,
                 type=encNode['type'])
         except (InvalidKeyIdException, InvalidMessageException) as ex:
             self.log.warn("Incoming Message [{messageId}] Decrypt Failed, message={message}, Going to send retry request",
@@ -66,24 +85,44 @@ class MessageHandler(NodeHandler):
             if encNode['v'] == "2":
                 plainText = removeRandomPadding(plainText)
 
-            self.log.debug("Decrypted PlainText: {plainText}", plainText=toHex(plainText))
+            self.log.debug("Decrypted PlainText: {plainText}", plainText=toCommaSeparatedNumber(plainText))
 
             messageProto = WAMessage_pb2.Message()
             messageProto.ParseFromString(plainText)
 
             if messageProto.HasField("protocolMessage"):
-                self._handleProtocolMessage(conn, node, messageProto.protocolMessage)
+                yield self._handleProtocolMessage(conn, node, messageProto.protocolMessage)
+            elif messageProto.HasField("senderKeyDistributionMessage"):
+                yield self._handleSenderKeyDistributionMessage(
+                    conn, node, messageProto.senderKeyDistributionMessage)
+
+                # remove the pkmsg/msg child first after processing sender key
+                # distribution message, and then repeat the call to self.handleNode
+                # so that it decrypt the actual skmsg message.
+                node.removeChild(encNode)
+                yield self.handleNode(conn, node)
+                return
             else:
-                self._sendReceipt(conn, node)
+                yield maybeDeferred(self._sendReceipt, conn, node)
                 self._handleIncomingMessage(conn, messageProto, node=node)
 
 
+    @inlineCallbacks
     def _handleProtocolMessage(self, conn, node, protocolMessage):
-        if protocolMessage.type == WAMessage_pb2.ProtocolMessage.HISTORY_SYNC_NOTIFICATION:
-            self._sendReceipt(conn, node)
-            historySyncNotification = protocolMessage.historySyncNotification
-            self._handleHistorySyncNotification(conn, node, historySyncNotification)
+        respNode = yield self._sendPeerMsgReceipt(conn, node)
 
+        if protocolMessage.type == WAMessage_pb2.ProtocolMessage.HISTORY_SYNC_NOTIFICATION:
+            yield self._sendPeerMsgReceipt(conn, respNode)
+            yield self._handleHistorySyncNotification(
+                conn, node, protocolMessage.historySyncNotification)
+
+    @inlineCallbacks
+    def _handleSenderKeyDistributionMessage(self, conn, node, senderKeyDistributionMessage):
+        yield processSenderKeyDistributionMessage(
+            conn.authState.store,
+            senderKeyDistributionMessage.groupId.split("@")[0],
+            node['participant'].split("@")[0],
+            senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage)
 
     @inlineCallbacks
     def _handleHistorySyncNotification(self, conn, node, historySyncNotification):
@@ -115,41 +154,112 @@ class MessageHandler(NodeHandler):
     def _handleIncomingMessage(self, conn, messageProto, node=None, isRead=False):
         if (
             not isinstance(messageProto, WAMessage_pb2.WebMessageInfo) and
-            node is not None and
             messageProto.HasField("deviceSentMessage")
         ):
-            # Message sent from own device
-            m = WAMessage_pb2.Message()
-            m.MergeFrom(messageProto.deviceSentMessage.message)
+            messageProto = messageProto.deviceSentMessage
+
+        if not isinstance(messageProto, WAMessage_pb2.WebMessageInfo):
+            messageKey = WAMessage_pb2.MessageKey()
+            messageKey.remoteJid = node['from']
+
+            if isGroupJid(node['from']):
+                sender = node['participant']
+            else:
+                sender = node['from']
+
+            if(isJidSameUser(sender, conn.authState.me['jid'])):
+                messageKey.fromMe = True
+            else:
+                messageKey.fromMe = False
+
+            messageKey.id = node['id']
+            m = WAMessage_pb2.WebMessageInfo()
+            m.key.MergeFrom(messageKey)
+            m.message.MergeFrom(messageProto)
+            m.messageTimestamp = int(node['t'])
+
+            if node['participant'] is not None:
+                m.participant = node['participant']
+
             messageProto = m
-            node['fromMe'] = True
 
         try:
-            message = WhatsAppMessage.fromMessageProto(messageProto, node=node, isRead=isRead)
+            message = WhatsAppMessage.fromWebMessageInfoProto(messageProto, isRead=isRead)
         except:
             self.log.failure("Failed to parse from protocol message")
         else:
             conn.fire("inbox", conn, message)
 
     def _sendReceipt(self, conn, node):
-        if node['category'] is not None and node['category'] == "peer":
-            conn.sendMessageNode(Node(
-                "receipt", {
-                    'id': node['id'],
-                    'to': node['from'],
-                    'type': "peer_msg"
-                }))
-        elif isJidSameUser(node['from'], conn.authState.me['jid']):
-            conn.sendMessageNode(Node(
-                "receipt", {
-                    'id': node['id'],
-                    'to': node['from'],
-                    'recipient': node['recipient'],
-                    'type': "sender"
-                }))
+        """
+            1.Contact Receipt
+                a. Message received from another user:
+                    {
+                        'id': node['id'],
+                        'to': node['to']
+                    }
+
+                b. Message sent from own device:
+                    {
+                        'id': node['id'],
+                        'to': node['to'],
+                        'recipient': node['recipient'],
+                        'type': "sender"
+                    }
+
+            2.Group Receipt
+                a. Message received from another user to group:
+                    {
+                        'id': node['id'],
+                        'to': node['to'],
+                        'pariticipant': node['participant']
+                    }
+
+                b. Message sent from own device:
+                    {
+                        'id': node['id'],
+                        'to': node['to'],
+                        'participant': node['participant']
+                        'type': "sender"
+                    }
+        """
+
+        receiptNode = Node("receipt", {
+            'id': node['id'],
+            'to': node['from']
+        })
+
+        if node['participant'] is not None:
+            receiptNode['participant'] = node['participant']
+
+        isGroup = isGroupJid(node['from'])
+
+        if isGroup:
+            _from = node['participant']
         else:
-            conn.sendMessageNode(Node(
-                "receipt", {
-                    'id': node['id'],
-                    'to': node['from'],
-                }))
+            _from = node['from']
+
+        if isJidSameUser(_from, conn.authState.me['jid']):
+            if not isGroup:
+                receiptNode['recipient'] = node['recipient']
+
+            receiptNode['type'] = "sender"
+
+        conn.sendMessageNode(receiptNode)
+        return succeed(receiptNode)
+
+    def _sendPeerMsgReceipt(self, conn, node, wait=True):
+        assert node.tag in ["message", "ack"]
+
+        if node.tag == "message":
+            type = "peer_msg"
+        elif node.tag == "ack":
+            type = "hist_sync"
+
+        receiptNode = Node("receipt")
+
+        receiptNode['to'] = node['from']
+        receiptNode['id'] = node['id']
+        receiptNode['type'] = type
+
+        return conn.request(receiptNode)

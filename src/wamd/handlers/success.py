@@ -1,7 +1,8 @@
 from twisted.internet.defer import inlineCallbacks
 
 from .base import NodeHandler
-from wamd.coder import splitJid, Node
+from wamd.coder import Node
+from wamd.utils import splitJid
 
 
 class SuccessHandler(NodeHandler):
@@ -10,7 +11,7 @@ class SuccessHandler(NodeHandler):
     def handleNode(self, conn, node):
         if not conn.authState.serverHasPreKeys:
             yield conn._uploadPreKeys()
-            conn.authState.serverHasPreKeys = True
+            conn.authState['serverHasPreKeys'] = True
 
         yield conn.request(
             Node("iq", {

@@ -30,25 +30,19 @@ class IqHandler(NodeHandler):
             # reload qr from ref list
             refNodes = node.children[0].getChilds("ref")
 
-            qrInfo = [
-                refNodes[0].content,
-                base64.b64encode(conn.authState.noiseKey.getPublicKey().getPublicKey()),
-                base64.b64encode(conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
-                base64.b64encode(conn.authState.advSecretKey)
-            ]
-
-            conn.fire("qr", qrInfo).addErrback(
-                lambda f: self.log.error("Handle QR Failure: {failure}", failure=f)
-            )
-
             conn.sendMessageNode(Node(
                 "iq", attributes={
                     'to': "@s.whatsapp.net",
                     'type': "result",
                     'id': node['id']
-                }))
+                }
+            ))
+
+            conn._startQrLoop([ref.content for ref in refNodes])
 
         elif node.children[0].tag == "pair-success":
+            conn._stopQrLoop()
+
             c = node.children[0].findChild("device-identity")
             deviceIdentity = c.content
             c = node.children[0].findChild("device")
@@ -88,15 +82,15 @@ class IqHandler(NodeHandler):
                 deviceMessage
             )
 
-            conn.authState.me = {'jid': jid}
-            conn.authState.signalIdentity = {
+            conn.authState['me'] = {'jid': jid}
+            conn.authState['signalIdentity'] = {
                 'identifier': {
                     'name': jid,
                     'deviceId': 0
                 },
                 'identifierKey': b"\x05" + signedDeviceIdentity.accountSignatureKey
             }
-            conn.authState.signedDeviceIdentity = {
+            conn.authState['signedDeviceIdentity'] = {
                 'details': signedDeviceIdentity.details,
                 'accountSignature': signedDeviceIdentity.accountSignature,
                 'accountSignatureKey': signedDeviceIdentity.accountSignatureKey,
