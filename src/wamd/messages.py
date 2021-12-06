@@ -13,6 +13,7 @@ from wamd.utils import (
     jsonToProtoMessage,
     isGroupJid
 )
+from wamd.constants import Constants
 
 
 class WhatsAppMessage:
@@ -24,7 +25,14 @@ class WhatsAppMessage:
             kwargs['id'] = self.generateMessageId()
 
         if "to" in kwargs and "@" not in kwargs['to']:
-            kwargs['to'] = kwargs['to'] + "@s.whatsapp.net"
+            raise ValueError("Invalid Jid: %s" % (kwargs['to']))
+
+        if "from" in kwargs and kwargs['from'].endswith("@c.us"):
+            user, server = kwargs['from'].split("@")
+            kwargs['from'] = kwargs['from'] = "%s%s" % (user, Constants.S_WHATSAPP_NET)
+        elif "to" in kwargs and kwargs['to'].endswith("@c.us"):
+            user, server = kwargs['to'].split("@")
+            kwargs['to'] = kwargs['to'] = "%s%s" % (user, Constants.S_WHATSAPP_NET)
 
         if "fromMe" not in kwargs:
             kwargs['fromMe'] = True

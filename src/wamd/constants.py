@@ -7,7 +7,7 @@ class Constants:
     DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36"
     DEFAULT_ORIGIN = "https://web.whatsapp.com"
     WHATSAPP_WEB_VERSION = [2, 2146, 9]
-    DEFAULT_BROWSER_KIND = ["Linux", "Chrome", "x86_64"]
+    DEFAULT_BROWSER_KIND = ["NusaSMS", "Chrome", "x86_64"]
     BUILD_HASH = "S9Kdc4pc4EJryo21snc5cg=="
     PROLOGUE = bytes([87, 65, 5, 2])
     WHATSAPP_LONG_TERM = bytes([
@@ -18,6 +18,7 @@ class Constants:
     MEDIA_HOST = "mmg.whatsapp.net"
     FLAG_COMPRESSED = 0x02
     S_WHATSAPP_NET = "@s.whatsapp.net"
+    G_US = "@g.us"
     MAX_PREKEYS_UPLOAD = 30
 
     IS_LITTLE_ENDIAN = sys.byteorder == "little"

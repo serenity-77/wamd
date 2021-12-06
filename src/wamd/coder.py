@@ -508,7 +508,13 @@ class Node:
             self.attributes = {}
         self.attributes[key] = value
 
-    def findChild(self, tag):
+    def findChild(self, tag=None):
+        if tag is None:
+            try:
+                return self.children[0]
+            except IndexError:
+                return None
+                
         for child in self.children:
             if child.tag == tag:
                 return child

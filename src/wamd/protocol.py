@@ -6,9 +6,12 @@ import json
 from io import BytesIO
 
 from twisted.internet.defer import (
-    inlineCallbacks, Deferred, maybeDeferred, succeed, fail
+    inlineCallbacks,
+    Deferred,
+    maybeDeferred,
+    succeed,
+    fail
 )
-
 from twisted.protocols.tls import TLSMemoryBIOFactory
 from twisted.internet.task import LoopingCall
 from twisted.python.failure import Failure
@@ -52,7 +55,10 @@ from .utils import (
     encodeUint,
     decodeUint,
     splitJid,
+    buildJid,
     isJidSameUser,
+    isGroupJid,
+    jidNormalize,
     generateRandomNumber,
     toCommaSeparatedNumber,
     inflate,
@@ -68,9 +74,17 @@ from .handlers import createNodeHandler
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import WhatsAppMessage, TextMessage, MediaMessage
-from .signalhelper import processPreKeyBundle, encrypt as signalEncrypt
+from .signalhelper import (
+    processPreKeyBundle,
+    encrypt as signalEncrypt,
+    groupEncrypt,
+    getOrCreateSenderKeyDistributionMessage
+)
 from .http import request as doHttpRequest
 from .common import AuthState
+from .iface import ISignalStore, ICachedMediaStore, IGroupStore
+from .conn_utils import getUsyncDeviceList
+
 
 _VALID_EVENTS = ["qr", "close", "inbox", "receipt"]
 
@@ -86,7 +100,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     _serverHelloDeferred = None
 
-    def __init__(self, authState, useSentQueue=False, reactor=None):
+    def __init__(self, authState=None, useSentQueue=False, reactor=None):
         WebSocketClientProtocol.__init__(self)
 
         validEvents = [] if self._valid_events is None else self._valid_events.copy()
@@ -94,20 +108,17 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         self.set_valid_events(validEvents)
 
+        if authState is None:
+            authState = AuthState()
+
         self.authState = authState
 
         if reactor is None:
             from twisted.internet import reactor
 
         self.reactor = reactor
-
         self._pendingRequest = {}
 
-        # For now this will be here
-        # but in the future it will be stored at
-        # self.authState.store
-        self._cachedMedia = {}
-        self._pendingRetryMessage = {}
 
     def onOpen(self):
         self.log.info("Connected to whatsapp server: {peer}", peer=self.transport.getPeer())
@@ -220,6 +231,10 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             self._clearTransportCipher()
 
     def _clearTransportCipher(self):
+        # For now, this should be called before closing the connection
+        # Or after receiving closing signal from server.
+        # To prevent InvalidTag exception when decrypting
+        # close message. (b'\x88\x02\x03\xf3')
         self._sendCipher = None
         self._recvCipher = None
 
@@ -258,7 +273,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         self.log.debug("Certificate Verifcation OK")
 
-        clientPayload = self._buildClientPayloadHandshake()
+        clientPayload = yield self._buildClientPayloadHandshake()
 
         self.log.debug("Client Payload: {clientPayload}", clientPayload=clientPayload)
 
@@ -287,12 +302,15 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         self._startKeepAliveLoop()
 
 
+    @inlineCallbacks
     def _waitServerHello(self):
-        self._sendClientHello()
+        yield self._sendClientHello()
         self._serverHelloDeferred = Deferred()
-        return self._serverHelloDeferred
+        return (yield self._serverHelloDeferred)
 
+    @inlineCallbacks
     def _sendClientHello(self):
+        yield self.authState.initKeys()
         # Noise Initialization Noise_XX_25519_AESGCM_SHA256
         # ('e',),
         # ('e', 'ee', 's', 'es'),
@@ -331,6 +349,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         self.sendMessage(clientHelloPayload, True)
 
+    @inlineCallbacks
     def _buildClientPayloadHandshake(self):
         browser = Constants.DEFAULT_BROWSER_KIND
         version = Constants.WHATSAPP_WEB_VERSION
@@ -355,13 +374,19 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             companionProps.platformType = 1
             companionProps.requireFullSync = False
 
+            signalStore = ISignalStore(self.authState)
+
+            identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
+            registrationId = yield maybeDeferred(signalStore.getLocalRegistrationId)
+            signedPreKey = yield maybeDeferred(signalStore.loadSignedPreKey, -1)
+
             companionRegData.companionProps = companionProps.SerializeToString()
-            companionRegData.eRegid = encodeUint(self.authState.registrationId, 4)
+            companionRegData.eRegid = encodeUint(registrationId, 4)
             companionRegData.eKeytype = encodeUint(5, 1)
-            companionRegData.eIdent = self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()
-            companionRegData.eSkeyId = encodeUint(self.authState.signedPrekey.getId(), 3)
-            companionRegData.eSkeyVal = self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()
-            companionRegData.eSkeySig = self.authState.signedPrekey.getSignature()
+            companionRegData.eIdent = identityKeyPair.getPublicKey().getPublicKey().getPublicKey()
+            companionRegData.eSkeyId = encodeUint(signedPreKey.getId(), 3)
+            companionRegData.eSkeyVal = signedPreKey.getKeyPair().getPublicKey().getPublicKey()
+            companionRegData.eSkeySig = signedPreKey.getSignature()
 
             clientPayload.regData.MergeFrom(companionRegData)
         else:
@@ -459,21 +484,12 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             self._pendingRequest[node['id']] = deferred
         return deferred
 
-    _deviceJid = None
-
-    @property
-    def deviceJid(self):
-        if self._deviceJid is None:
-            user, _, _, server = splitJid(self.authState.me['jid'])
-            self._deviceJid = "%s@%s" % (user, server)
-        return self._deviceJid
-
     def sendReadReceipt(self, message):
         if message['fromMe'] or isJidSameUser(message['from'], self.authState.me['jid']):
             return fail(WAMDError("Cannot Send Read Receipt To Our Own Device"))
 
         receiptNode = Node("receipt", {
-            'to': message['from'],
+            'to': jidNormalize(message['from']),
             'type': "read",
             'id': message['id'],
             't': str(int(time.time()))
@@ -486,24 +502,26 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     def disconnectFromServer(self, logout=False):
         if logout:
-            self.sendMessageNode(Node(
-                "iq", {
-                    'to': Constants.S_WHATSAPP_NET,
-                    'type': "set",
-                    'id': self._generateMessageId(),
-                    'xmlns': "md"
-                }, Node("remove-companion-device", {
-                    'jid': self.authState.me['jid'],
-                    'reason': "user_initiated"
-                })
-            ))
-
+            self._sendLogout()
             self._handleFailure(NodeStreamError("401"))
 
         # self.reactor.callLater(0, lambda: self.sendClose(code=1000))
         # want to use self.sendClose, but it seems that the server
         # is the only one who can close the connection.
         self._sendStreamEnd()
+
+    def _sendLogOut(self):
+        self.sendMessageNode(Node(
+            "iq", {
+                'to': Constants.S_WHATSAPP_NET,
+                'type': "set",
+                'id': self._generateMessageId(),
+                'xmlns': "md"
+            }, Node("remove-companion-device", {
+                'jid': self.authState.me['jid'],
+                'reason': "user_initiated"
+            })
+        ))
 
     def sendMsg(self, message):
         # TODO
@@ -515,58 +533,35 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
                 TypeError("Must be an instance of %s" % qual(WhatsAppMessage))
             )
 
-        if not isinstance(message, (TextMessage, MediaMessage)):
+        if isinstance(message, TextMessage):
+            d = self._processTextMessage(message)
+
+        elif isinstance(message, MediaMessage):
+            d = self._processMediaMessage(message)
+
+        else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
             )
 
-        if isinstance(message, TextMessage):
-            d = self._processTextMessageAndSend(message)
-            messageType = "text"
+        # TODO
+        # Before sending to group, maybe check if group exists
 
-        elif isinstance(message, MediaMessage):
-            d = self._processMediaMessageAndSend(message)
-            messageType = "media"
+        def onProcessMessageDone(messageNode):
+            # Ignore message ack, Just passthrough
+            return self.request(messageNode).addCallback(
+                lambda _: message)
 
-        def _wrapFailure(failure):
-            try:
-                failure.trap(SendMessageError)
-            except:
-                failure = Failure(
-                    SendMessageError("%s" % (failure)))
-            return failure
+        return d.addCallback(onProcessMessageDone)
 
-        @inlineCallbacks
-        def _onParticipantsNode(participantsNode):
-            messageNode = Node(
-                "message", {
-                    'id': message['id'],
-                    'to': message['to'],
-                    'type': messageType
-                },
-                participantsNode)
 
-            hasPkMsg = list(filter(
-                lambda toNode: toNode.getChild("enc")['type'] == "pkmsg",
-                participantsNode.findChilds("to")))
-
-            if hasPkMsg:
-                messageNode.addChild(self._buildDeviceIdentityNode())
-
-            yield self.request(messageNode) # Ignore response ack
-
-            return message # passthrough
-
-        return d.addCallback(
-            _onParticipantsNode).addErrback(_wrapFailure)
-
+    def _processTextMessage(self, message):
+        if not message['conversation']:
+            return fail(SendMessageError("conversation parameters required"))
+        return self._makeMessageNode(message, "text")
 
     @inlineCallbacks
-    def _processTextMessageAndSend(self, message):
-        return (yield self._createParticipantsForMessage(message))
-
-    @inlineCallbacks
-    def _processMediaMessageAndSend(self, message):
+    def _processMediaMessage(self, message):
         if message['url'].startswith("http:") or message['url'].startswith("https:"):
             self.log.debug("Downloading file from {url}", url=message['url'])
             try:
@@ -582,7 +577,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             fileIO.close()
 
         fileSha256 = sha256Hash(fileContent)
-        savedMedia = yield maybeDeferred(self._maybeGetCachedMedia, fileSha256)
+
+        cachedMediaStore = ICachedMediaStore(self.authState)
+        savedMedia = yield maybeDeferred(cachedMediaStore.getCachedMedia, fileSha256)
 
         if savedMedia is None:
             mediaData = {}
@@ -624,7 +621,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
                 mediaData)
 
             yield maybeDeferred(
-                self._maybeSaveCachedMedia,
+                cachedMediaStore.saveCachedMedia,
                 fileSha256,
                 {'mediaType': mediaType, 'mediaData': mediaData})
         else:
@@ -637,13 +634,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         for k, v in mediaData.items():
             message[k] = v
 
-        participantsNode = yield self._createParticipantsForMessage(message)
-
-        for toNode in participantsNode.findChilds("to"):
-            encNode = toNode.findChild("enc")
-            encNode['mediatype'] = mediaType
-
-        return participantsNode
+        return (yield self._makeMessageNode(message, "media", mediaType))
 
 
     @inlineCallbacks
@@ -729,63 +720,196 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         duration = int(adapter.info['format']['duration'])
         mediaData['seconds'] = duration
 
+    def _usyncQuery(self, jids, context):
+        if not jids:
+            return fail("jids required in usync query")
+
+        iqNode = Node("iq", {
+            'to': Constants.S_WHATSAPP_NET,
+            'xmlns': "usync",
+            'type': "get",
+            'id': self._generateMessageId()
+        }, Node("usync", {
+            'sid': self._generateMessageId(),
+            'index': "0",
+            'last': "true",
+            'mode': "query",
+            'context': context
+        }, [
+            Node("query", None, Node("devices", {'version': '2'})),
+            Node("list", None, [Node("user", {'jid': jid}) for jid in jids])
+        ]))
+
+        return self.request(iqNode)
+
     @inlineCallbacks
-    def _createParticipantsForMessage(self, message):
+    def _makeMessageNode(self, message, messageType, mediaType=None):
+        isGroup = isGroupJid(message['to'])
+
+        messageNode = Node("message", {
+            'id': message['id'],
+            'to': message['to'],
+            'type': messageType
+        })
+
         messageProto = message.toProtobufMessage()
 
-        deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
-        deviceSentMessageProto.destinationJid = message['to']
-        deviceSentMessageProto.message.MergeFrom(messageProto)
+        signalStore = ISignalStore(self.authState)
 
-        deviceMessageProto = WAMessage_pb2.Message()
-        deviceMessageProto.deviceSentMessage.MergeFrom(deviceSentMessageProto)
+        @inlineCallbacks
+        def _ensureSession(recipients):
+            if not recipients:
+                return
+            keyRequestJids = []
+            for recipient in recipients:
+                if not (yield maybeDeferred(
+                    signalStore.containSession, recipient.split("@")[0], 1)
+                ):
+                    keyRequestJids.append(recipient)
 
-        messageRecipients = [message['to']]
+            if keyRequestJids:
+                preKeyBundles = yield self._requestPreKeyBundles(keyRequestJids)
+                for fullJid, preKeyBundle in preKeyBundles.items():
+                    yield processPreKeyBundle(signalStore, preKeyBundle, fullJid.split("@")[0])
 
-        if self.authState.has("syncedDevice") and self.authState.syncedDevice['devices']:
-            for jid in self.authState.syncedDevice['devices']:
-                messageRecipients.append(jid)
+        @inlineCallbacks
+        def _getUsyncRecipients(usyncJids):
+            userDevices = getUsyncDeviceList((yield self._usyncQuery(usyncJids, "message")).findChild("usync"))
+            userDevices[meJid].remove(meDevice)
+            recipients = []
+            for p, devices in userDevices.items():
+                user, agent, _, server = splitJid(p)
+                for device in devices:
+                    if device == "0":
+                        recipients.append(p)
+                    else:
+                        recipients.append(buildJid(user, server, agent, device))
+            return recipients
+
+        meUser, meAgent, meDevice, meServer = splitJid(self.authState.me['jid'])
+        meJid = jidNormalize(self.authState.me['jid'])
+
+        if isGroup:
+            groupId = message['to'].split("@")[0]
+            groupStore = IGroupStore(self.authState)
+            participants = yield maybeDeferred(
+                groupStore.getAllGroupParticipants, groupId)
+
+            usyncJids = [p['jid'] for p in participants]
+            deviceParticipants = yield _getUsyncRecipients(usyncJids)
+
+            flaggedSenderKeys = yield maybeDeferred(
+                groupStore.getAllFlaggedSenderKeys, groupId)
+
+            recipients = []
+
+            for p in flaggedSenderKeys:
+                if p not in deviceParticipants:
+                    yield maybeDeferred(groupStore.removeSenderKeyFlag, groupId, p)
+
+            for p in deviceParticipants:
+                if p not in flaggedSenderKeys:
+                    recipients.append(p)
+                    yield maybeDeferred(groupStore.flagSenderKey, groupId, p)
+
         else:
-            # this means only our own device and destination
-            messageRecipients.append(self.deviceList)
+            usyncJids = [message['to'], jidNormalize(self.authState.me['jid'])]
+            recipients = yield _getUsyncRecipients(usyncJids)
 
-        keyRequestJids = []
-        for fullJid in messageRecipients:
-            if not (yield maybeDeferred(
-                self.authState.store.containSession, fullJid.split("@")[0], 1)
-            ):
-                keyRequestJids.append(fullJid)
+        participantsNode = None
+        skMsgNode = None
 
-        if keyRequestJids:
-            preKeyBundles = yield self._requestPreKeyBundles(keyRequestJids)
+        yield _ensureSession(recipients)
 
-            for fullJid, preKeyBundle in preKeyBundles.items():
-                yield processPreKeyBundle(self.authState.store, preKeyBundle, fullJid.split("@")[0])
+        if isGroup:
+            participantId = self.authState.me['jid'].split("@")[0]
+            if recipients:
+                skMessage = yield getOrCreateSenderKeyDistributionMessage(
+                    signalStore, groupId, participantId)
 
-        participantsNode = Node("participants")
+                skMessageProto = WAMessage_pb2.SenderKeyDistributionMessage()
+                skMessageProto.groupId = message['to']
+                skMessageProto.axolotlSenderKeyDistributionMessage = skMessage.serialize()
 
-        for toJid in messageRecipients:
-            if toJid == message['to']:
-                paddedMessage = addRandomPadding(messageProto.SerializeToString())
-            else:
-                paddedMessage = addRandomPadding(deviceMessageProto.SerializeToString())
+                senderKeyMessageProto = WAMessage_pb2.Message()
+                senderKeyMessageProto.senderKeyDistributionMessage.MergeFrom(skMessageProto)
 
-            type, cipherText = yield signalEncrypt(
-                self.authState.store, paddedMessage, toJid.split("@")[0])
+                participantsNode = Node("participants")
 
-            participantsNode.addChild(Node(
-                "to", {
-                    'jid': toJid
-                }, Node(
-                    'enc', {
-                        'v': "2",
-                        'type': type
-                    }, cipherText
-                )
-            ))
+                for recipient in recipients:
+                    type, cipherText = yield signalEncrypt(
+                        signalStore,
+                        addRandomPadding(senderKeyMessageProto.SerializeToString()),
+                        recipient.split("@")[0])
 
-        return participantsNode
+                    participantsNode.addChild(Node(
+                        "to", {
+                            'jid': recipient
+                        }, Node("enc", {
+                            'v': "2",
+                            'type': type
+                        }, cipherText)
+                    ))
 
+            groupCipherText = yield groupEncrypt(
+                signalStore, groupId, participantId,
+                addRandomPadding(messageProto.SerializeToString()))
+
+            skMsgNode = Node("enc", {
+                'v': "2",
+                'type': "skmsg"
+            }, groupCipherText)
+
+            if mediaType is not None:
+                skMsgNode['mediatype'] = mediaType
+
+        else:
+            yield _ensureSession(recipients)
+
+            deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
+            deviceSentMessageProto.destinationJid = message['to']
+            deviceSentMessageProto.message.MergeFrom(messageProto)
+            deviceMessageProto = WAMessage_pb2.Message()
+            deviceMessageProto.deviceSentMessage.MergeFrom(deviceSentMessageProto)
+
+            participantsNode = Node("participants")
+
+            for recipient in recipients:
+                if isJidSameUser(recipient, self.authState.me['jid']):
+                    paddedMessage = addRandomPadding(deviceMessageProto.SerializeToString())
+                else:
+                    paddedMessage = addRandomPadding(messageProto.SerializeToString())
+                type, cipherText = yield signalEncrypt(signalStore,
+                    paddedMessage, recipient.split("@")[0])
+
+                encNode = Node("enc", {
+                    'v': "2",
+                    'type': type
+                }, cipherText)
+
+                if mediaType is not None:
+                    encNode['mediatype'] = mediaType
+
+                participantsNode.addChild(Node(
+                    "to", {
+                        'jid': recipient
+                    }, encNode
+                ))
+
+        hasPkMsg = False
+        if participantsNode is not None:
+            messageNode.addChild(participantsNode)
+            hasPkMsg = list(filter(
+                lambda toNode: toNode.getChild("enc")['type'] == "pkmsg",
+                participantsNode.findChilds("to"))).__len__() > 0
+
+        if skMsgNode is not None:
+            messageNode.addChild(skMsgNode)
+
+        if hasPkMsg:
+            messageNode.addChild(self._buildDeviceIdentityNode())
+
+        return messageNode
 
     @inlineCallbacks
     def _requestPreKeyBundles(self, jids):
@@ -859,10 +983,12 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         preKeysContent = []
 
+        signalStore = ISignalStore(self.authState)
+
         for preKey in preKeys:
             try:
                 yield maybeDeferred(
-                    self.authState.store.storePreKey, preKey.getId(), preKey)
+                    signalStore.storePreKey, preKey.getId(), preKey)
                 preKeysContent.append(
                     Node("key", None, [
                         Node("id", None, encodeUint(preKey.getId(), 3)),
@@ -871,7 +997,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             except:
                 self.log.error("Failed to store prekey: {failure}", failure=Failure())
 
-        preKeys = []
+        identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
+        registrationId = yield maybeDeferred(signalStore.getLocalRegistrationId)
+        signedPreKey = yield maybeDeferred(signalStore.loadSignedPreKey, -1)
 
         yield self.request(
             Node("iq", attributes={
@@ -880,19 +1008,20 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
                 'type': "set",
                 'to': Constants.S_WHATSAPP_NET
             }, content=[
-                Node("registration", None, encodeUint(self.authState.registrationId, 4)),
+                Node("registration", None, encodeUint(registrationId, 4)),
                 Node("type", None, encodeUint(curve.Curve.DJB_TYPE, 1)),
-                Node("identity", None, self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
+                Node("identity", None, identityKeyPair.getPublicKey().getPublicKey().getPublicKey()),
                 Node("list", None, preKeysContent),
                 Node("skey", None, [
-                    Node("id", None, encodeUint(self.authState.signedPrekey.getId(), 3)),
-                    Node("value", None, self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()),
-                    Node("signature", None, self.authState.signedPrekey.getSignature())
+                    Node("id", None, encodeUint(signedPreKey.getId(), 3)),
+                    Node("value", None, signedPreKey.getKeyPair().getPublicKey().getPublicKey()),
+                    Node("signature", None, signedPreKey.getSignature())
                 ])
             ]))
 
         self.authState['nextPreKeyId'] = maxPreKeyId + 1
 
+    @inlineCallbacks
     def _sendRetryReceiptRequest(self, messageNode):
         retryCount = messageNode.findChild("enc")['count']
 
@@ -907,72 +1036,61 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             'type': "retry"
         })
 
-        if node['participant'] is not None:
-            receiptNode['participant'] = node['participant']
+        if messageNode['participant'] is not None:
+            receiptNode['participant'] = messageNode['participant']
 
         receiptNode.addChild(Node(
             "retry", {
                 'v': "1",
                 'count': str(retryCount),
-                'id': node['id'],
+                'id': messageNode['id'],
                 't': str(int(time.time()))
             }
         ))
 
-        if retryCount > 1:
-            receiptNode.addChild(Node(
-                "registration", Node, encodeUint(self.authState.registrationId)
-            ))
+        signalStore = ISignalStore(self.authState)
+        registrationId = yield maybeDeferred(signalStore.getLocalRegistrationId)
 
+        receiptNode.addChild(Node(
+            "registration", None, encodeUint(registrationId, 4)
+        ))
+
+        if retryCount > 1:
+            identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
+            signedPreKey = yield maybeDeferred(signalStore.loadSignedPreKey, -1)
             preKey = KeyHelper.generatePreKeys(self.authState.nextPreKeyId, 1)[0]
-            self.authState['nextPreKeyId'] += 1
+            yield maybeDeferred(signalStore.storePreKey, preKey.getId(), preKey)
 
             receiptNode.addChild(Node(
                 "keys", None, [
-                    Node("type", None, encodeUint(curve.Curve.DJB_TYPE)),
-                    Node("identity", None, self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
+                    Node("type", None, encodeUint(curve.Curve.DJB_TYPE, 1)),
+                    Node("identity", None, identityKeyPair.getPublicKey().getPublicKey().getPublicKey()),
                     Node("key", None, [
-                        Node("id", None, encodeUint(preKey.getId())),
-                        Node("value", preKey.getKeyPair().getPublicKey().getPublicKey())
+                        Node("id", None, encodeUint(preKey.getId(), 3)),
+                        Node("value", None, preKey.getKeyPair().getPublicKey().getPublicKey())
                     ]),
                     Node("skey", None, [
-                        Node("id", None, encodeUint(self.authState.signedPrekey.getId(), 3)),
-                        Node("value", None, self.authState.signedPrekey.getKeyPair().getPublicKey().getPublicKey()),
-                        Node("signature", None, self.authState.signedPrekey.getSignature())
+                        Node("id", None, encodeUint(signedPreKey.getId(), 3)),
+                        Node("value", None, signedPreKey.getKeyPair().getPublicKey().getPublicKey()),
+                        Node("signature", None, signedPreKey.getSignature())
                     ]),
                     self._buildDeviceIdentityNode()
                 ]
             ))
 
-        def errback(f):
-            # Retry again maybe?
-            # Or if it is caused by connection Lost then how?
-            self.log.failure("Send Retry Receipt Failed", failure=f)
-            self.authState['nextPreKeyId'] -= 1
-            return f
+        def callback(result):
+            self.authState['nextPreKeyId'] += 1
+            return result
 
-        return self.request(Node(
-            "receipt", {
-                'id': messageNode['id'],
-                'to': messageNode['from'],
-                'type': "retry"
-            }, [
-                Node("retry", {
-                    'count': retryCount,
-                    'id': messageNode['id'],
-                    'v': "1",
-                    't': messageNode['t']
-                }),
-                Node("registration", None, encodeUint(self.authState.registrationId, 4))
-            ]
-        )).addErrback(errback)
-
+        d = self.request(receiptNode).addCallback(callback)
+        yield d
 
     def _authOK(self):
         self.log.info("Authentication Success, Restarting Connection")
         self.factory._authState = self.authState
         self.authState = None
         self._clearTransportCipher()
+
 
     def _sendStreamEnd(self):
         if not self._streamEndReceived:
@@ -1015,21 +1133,27 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
                     self._sendStreamEnd()
                     self._handleFailure(Failure())
             else:
-                if initial[0]:
-                    initial[0] = False
-                    timeout = 57
-                else:
-                    timeout = 18
+                def onIdentityKey(identityKeyPair):
+                    if initial[0]:
+                        initial[0] = False
+                        timeout = 57
+                    else:
+                        timeout = 18
 
-                qrInfo = [
-                    qrRef,
-                    base64.b64encode(self.authState.noiseKey.getPublicKey().getPublicKey()),
-                    base64.b64encode(self.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()),
-                    base64.b64encode(self.authState.advSecretKey)
-                ]
+                    qrInfo = [
+                        qrRef,
+                        base64.b64encode(self.authState.noiseKey.getPublicKey().getPublicKey()),
+                        base64.b64encode(identityKeyPair.getPublicKey().getPublicKey().getPublicKey()),
+                        base64.b64encode(self.authState.advSecretKey)
+                    ]
 
-                self.fire("qr", qrInfo).addErrback(evErrback)
-                self._qrDelayedCall = self.reactor.callLater(timeout, resetDelayedCall)
+                    self.fire("qr", qrInfo).addErrback(evErrback)
+                    self._qrDelayedCall = self.reactor.callLater(timeout, resetDelayedCall)
+
+                signalStore = ISignalStore(self.authState)
+                maybeDeferred(signalStore.getIdentityKeyPair).addCallback(
+                    onIdentityKey
+                ).addErrback(evErrback)
 
         def evErrback(f):
             self._sendStreamEnd()
@@ -1064,18 +1188,6 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             self._messageTagCounter = 0
 
         return messageTag
-
-    def _maybeGetCachedMedia(self, cachedKey):
-        try:
-            return self._cachedMedia[cachedKey]
-        except KeyError:
-            return None
-
-    def _maybeSaveCachedMedia(self, cachedKey, mediaData):
-        self._cachedMedia[cachedKey] = mediaData
-
-    def _savePendingRetryMessage(self, key, message):
-        pass
 
 
 class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):
@@ -1143,7 +1255,6 @@ class MultiDeviceWhatsAppClientFactory(WebSocketClientFactory):
     def clientConnectionLost(self, connector, reason):
         if self._authState is not None:
             connector.connect()
-
 
 
 

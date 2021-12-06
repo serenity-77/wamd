@@ -1,56 +1,76 @@
 import os
 import base64
 
+from twisted.internet.defer import inlineCallbacks, maybeDeferred
 from twisted.python.reflect import qual
+from twisted.python.components import Componentized
 
 from axolotl.ecc import curve, djbec, eckeypair
 from axolotl.util.keyhelper import KeyHelper
-from axolotl.identitykey import IdentityKey
-from axolotl.identitykeypair import IdentityKeyPair
-from axolotl.state.signedprekeyrecord import SignedPreKeyRecord
 
-
-from .store.default import DefaultMemoryStore
-from .iface import IJsonSerializable
+from .iface import (
+    IJsonSerializableStore,
+    ISignalStore,
+    IGroupStore
+)
 
 
 _INITIAL_ATTRIBUTES = [
-    "identityKey",
     "noiseKey",
-    "signedPrekey",
-    "registrationId",
     "advSecretKey",
     "me",
     "signalIdentity",
-    "signedDeviceIdentity",
-    "syncedDevice"
+    "signedDeviceIdentity"
 ]
 
 
-class AuthState:
+_STORE_INTERFACES = {
+    '__SIGNALSTORE__': ISignalStore,
+    '__GROUPSTORE__': IGroupStore
+}
 
-    def __init__(self, init=True, store=None):
+
+class AuthState(Componentized):
+
+    def __init__(self):
         self._authState = {}
+        Componentized.__init__(self)
 
-        if store is None:
-            store = DefaultMemoryStore()
-            store.loadSignedPreKey = lambda keyId: self.signedPrekey
-            store.getIdentityKeyPair = lambda: self.identityKey
-            store.getLocalRegistrationId = lambda: self.registrationId
+        from .store.default import (
+            DefaultMemorySignalStore,
+            DefaultMemoryGroupStore,
+            DefaultCachedMediaStore
+        ) # Cyclic import
 
-        self.store = store
+        defaultSignalStore = DefaultMemorySignalStore()
+        defaultGroupStore = DefaultMemoryGroupStore()
+        defaultCachedMediaStore = DefaultCachedMediaStore()
 
-        if init:
-            self._initKeys()
+        self.addStoreComponent(defaultSignalStore)
+        self.addStoreComponent(defaultGroupStore)
+        self.addStoreComponent(defaultCachedMediaStore)
 
-    def _initKeys(self):
-        self['identityKey'] = KeyHelper.generateIdentityKeyPair()
+    @inlineCallbacks
+    def initKeys(self):
+        if self.has("initKeys"):
+            return
+
         self['noiseKey'] = curve.Curve.generateKeyPair()
-        self['signedPrekey'] = KeyHelper.generateSignedPreKey(self.identityKey, 1)
-        self['registrationId'] = KeyHelper.generateRegistrationId()
         self['advSecretKey'] = os.urandom(32)
         self['nextPreKeyId'] = 1
         self['serverHasPreKeys'] = False
+
+        identityKeyPair = KeyHelper.generateIdentityKeyPair()
+        signedPreKey = KeyHelper.generateSignedPreKey(identityKeyPair, 1)
+        registrationId = KeyHelper.generateRegistrationId()
+
+        signalStore = ISignalStore(self)
+
+        yield maybeDeferred(signalStore.saveIdentityKeyPair, identityKeyPair)
+        yield maybeDeferred(signalStore.storeSignedPreKey, signedPreKey.getId(), signedPreKey)
+        yield maybeDeferred(signalStore.saveLocalRegistrationId, registrationId)
+
+        self['initKeys'] = 1
 
     def __getattr__(self, name):
         try:
@@ -86,27 +106,11 @@ class AuthState:
     def toJson(self):
         jsonDict = {}
 
-        jsonDict['identityKey'] = {
-            'private': base64.b64encode(self.identityKey.getPrivateKey().getPrivateKey()).decode(),
-            'public': base64.b64encode(self.identityKey.getPublicKey().getPublicKey().getPublicKey()).decode()
-        }
-
         jsonDict['noiseKey'] = {
             'private': base64.b64encode(self.noiseKey.getPrivateKey().getPrivateKey()).decode(),
             'public': base64.b64encode(self.noiseKey.getPublicKey().getPublicKey()).decode()
         }
 
-        jsonDict['signedPrekey'] = {
-            'id': self.signedPrekey.getId(),
-            'timestamp': self.signedPrekey.getTimestamp(),
-            'keyPair': {
-                'private': base64.b64encode(self.signedPrekey.getKeyPair().getPrivateKey().getPrivateKey()).decode(),
-                'public': base64.b64encode(self.signedPrekey.getKeyPair().getPublicKey().getPublicKey()).decode()
-            },
-            'signature': base64.b64encode(self.signedPrekey.getSignature()).decode()
-        }
-
-        jsonDict['registrationId'] = self.registrationId
         jsonDict['advSecretKey'] = base64.b64encode(self.advSecretKey).decode()
 
         if self.has("me"):
@@ -126,18 +130,12 @@ class AuthState:
                 'deviceSignature': base64.b64encode(self.signedDeviceIdentity['deviceSignature']).decode()
             }
 
-        if self.has("syncedDevice"):
-            jsonDict['syncedDevice'] = self['syncedDevice']
-
-        store = self.store
-
-        if IJsonSerializable.providedBy(store):
-            # TODO
-            # Async toJson
-            jsonDictStore = store.toJson()
-            if jsonDictStore:
-                jsonDict['store'] = {}
-                jsonDict['store'].update(jsonDictStore)
+        for name, iface in _STORE_INTERFACES.items():
+            store = iface(self)
+            if IJsonSerializableStore.providedBy(store):
+                jsonStore = store.toJson()
+                if jsonStore:
+                    jsonDict[name] = jsonStore
 
         for k, v in self._authState.items():
             if k not in _INITIAL_ATTRIBUTES:
@@ -145,62 +143,29 @@ class AuthState:
 
         return jsonDict
 
-    @classmethod
-    def fromJson(cls, jsonDict):
-        authState = cls(init=False)
-
-        try:
-            identityKey = jsonDict.pop("identityKey")
-        except KeyError:
-            pass
-        else:
-            authState['identityKey'] = IdentityKeyPair(
-                IdentityKey(djbec.DjbECPublicKey(base64.b64decode(identityKey['public']))),
-                djbec.DjbECPrivateKey(base64.b64decode(identityKey['private'])))
-
+    def populateFromJson(self, jsonDict):
         try:
             noiseKey = jsonDict.pop("noiseKey")
         except KeyError:
             pass
         else:
-            authState['noiseKey'] = eckeypair.ECKeyPair(
+            self['noiseKey'] = eckeypair.ECKeyPair(
                 djbec.DjbECPublicKey(base64.b64decode(noiseKey['public'])),
                 djbec.DjbECPrivateKey(base64.b64decode(noiseKey['private'])))
-
-        try:
-            signedPrekey = jsonDict.pop("signedPrekey")
-        except KeyError:
-            pass
-        else:
-            authState['signedPrekey'] = SignedPreKeyRecord(
-                _id=signedPrekey['id'],
-                timestamp=signedPrekey['timestamp'],
-                ecKeyPair=eckeypair.ECKeyPair(
-                    djbec.DjbECPublicKey(base64.b64decode(signedPrekey['keyPair']['public'])),
-                    djbec.DjbECPrivateKey(base64.b64decode(signedPrekey['keyPair']['private']))
-                ),
-                signature=base64.b64decode(signedPrekey['signature']))
-
-        try:
-            registrationId = jsonDict.pop("registrationId")
-        except KeyError:
-            pass
-        else:
-            authState['registrationId'] = registrationId
 
         try:
             advSecretKey = jsonDict.pop("advSecretKey")
         except KeyError:
             pass
         else:
-            authState['advSecretKey'] = base64.b64decode(advSecretKey)
+            self['advSecretKey'] = base64.b64decode(advSecretKey)
 
         try:
             signalIdentity = jsonDict.pop("signalIdentity")
         except KeyError:
             pass
         else:
-            authState['signalIdentity'] = {
+            self['signalIdentity'] = {
                 'identifier': signalIdentity['identifier'],
                 'identifierKey': base64.b64decode(signalIdentity['identifierKey'])
             }
@@ -210,39 +175,55 @@ class AuthState:
         except KeyError:
             pass
         else:
-            authState['signedDeviceIdentity'] = {
+            self['signedDeviceIdentity'] = {
                 'details': base64.b64decode(signedDeviceIdentity['details']),
                 'accountSignature': base64.b64decode(signedDeviceIdentity['accountSignature']),
                 'accountSignatureKey': base64.b64decode(signedDeviceIdentity['accountSignatureKey']),
                 'deviceSignature': base64.b64decode(signedDeviceIdentity['deviceSignature'])
             }
 
-        try:
-            syncedDevice = jsonDict.pop("syncedDevice")
-        except KeyError:
-            pass
-        else:
-            authState['syncedDevice'] = syncedDevice
-
-        if IJsonSerializable.providedBy(authState.store):
-            try:
-                jsonDictStore = jsonDict.pop("store")
-            except KeyError:
-                pass
-            else:
-                # TODO
-                # Async populate
-                authState.store.populate(jsonDictStore)
+        for name, iface in _STORE_INTERFACES.items():
+            store = iface(self)
+            if IJsonSerializableStore.providedBy(store):
+                try:
+                    jsonDictStore = jsonDict.pop(name)
+                except KeyError:
+                    pass
+                else:
+                    store.populate(jsonDictStore)
 
         for k, v in jsonDict.items():
-            authState[k] = v
+            self[k] = v
 
-        return authState
-
-    def setStore(self, store):
-        self.store = store
+    def addStoreComponent(self, component):
+        self.addComponent(component, ignoreClass=1)
 
     def __repr__(self):
         return "<%s Object at 0x%x %s>" % (qual(self.__class__), id(self), str(self._authState))
 
     __str__ = __repr__
+
+
+
+class _NoKeyErrorDictMixin(dict):
+
+    def __getitem__(self, item):
+        try:
+            return dict.__getitem__(self, item)
+        except KeyError:
+            return None
+
+
+class GroupInfo(_NoKeyErrorDictMixin):
+    def __init__(self, **kwargs):
+        _NoKeyErrorDictMixin.__init__(self, **kwargs)
+
+
+class GroupParticipant(_NoKeyErrorDictMixin):
+    def __init__(self, **kwargs):
+        _NoKeyErrorDictMixin.__init__(self, **kwargs)
+
+    def __eq__(self, jid):
+        if isinstance(jid, str):
+            return jid == self['jid']
+        return _NoKeyErrorDictMixin.__eq__(self)

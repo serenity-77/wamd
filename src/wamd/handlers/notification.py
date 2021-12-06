@@ -1,58 +1,82 @@
-from twisted.internet.defer import inlineCallbacks
+from twisted.internet.defer import inlineCallbacks, maybeDeferred
+
 from .base import NodeHandler
 from wamd.coder import Node
-from wamd.utils import splitJid
+from wamd.utils import splitJid, isJidSameUser, jidNormalize
 from wamd.constants import Constants
+from wamd.iface import ISignalStore, IGroupStore
+from wamd.common import GroupInfo, GroupParticipant
+from wamd.signalhelper import SenderKeyName
+from wamd.conn_utils import addGroupInfo
 
 
 class NotificationHandler(NodeHandler):
 
     @inlineCallbacks
     def handleNode(self, conn, node):
-        conn.sendMessageNode(
-            Node("ack", {
-                'class': "notification",
-                'id': node['id'],
-                'type': node['type'],
-                'to': node['from']
-            }))
+        ackNode = Node("ack", {
+            'to': node['from'],
+            'id': node['id'],
+            'class': "notification"
+        })
+
+        if node['participant'] is not None:
+            # For Group Notification
+            ackNode['participant'] = node['participant']
+        elif node['type'] is not None and node['type'] != "devices":
+            ackNode['type'] = node['type']
+
+        conn.sendMessageNode(ackNode)
 
         if node['type'] == "encrypt":
-            yield self._handlePrekeysNotification(conn, node)
+            yield self._handlePreKeysNotification(conn, node)
 
-        elif node['type'] == "account_sync":
-            yield self._handleAccountSyncNotification(conn, node)
+        elif node['type'] == "w:gp2":
+            yield self._handleGroupNotification(conn, node)
 
     @inlineCallbacks
-    def _handlePrekeysNotification(self, conn, node):
+    def _handlePreKeysNotification(self, conn, node):
         countNode = node.getChild("count")
         if countNode and countNode['value'] is not None:
             uploadCount = Constants.MAX_PREKEYS_UPLOAD - int(countNode['value'])
             yield conn._uploadPreKeys(count=uploadCount)
 
+
     @inlineCallbacks
-    def _handleAccountSyncNotification(self, conn, node):
-        devices = node.getChild("devices")
+    def _handleGroupNotification(self, conn, node):
+        groupStore = IGroupStore(conn.authState)
+        child = node.getChild()
 
-        if devices:
-            if not conn.authState.has("syncedDevice"):
-                conn.authState['syncedDevice'] = {
-                    'dhash': devices['dhash'],
-                    'devices': []
-                }
+        groupId = node['from'].split("@")[0]
+
+        if child.tag == "remove":
+            participantJid = child.findChild("participant")['jid']
+            participants = []
+            if isJidSameUser(participantJid, conn.authState.me['jid']):
+                # Kick
+                for participant in (yield groupStore.getAllGroupParticipants(groupId)):
+                    participants.append(participant['jid'])
+
+                yield maybeDeferred(groupStore.removeGroupInfo, groupId)
+
             else:
-                conn.authState['syncedDevice']['dhash'] = devices['dhash']
+                yield maybeDeferred(
+                    groupStore.removeGroupParticipant, groupId, participantJid)
+                participants.append(participantJid)
 
-            deviceList = []
-            _, _, meDeviceN, _ = splitJid(conn.authState.me['jid'])
+            # remove sender key, if present.
+            signalStore = ISignalStore(conn.authState)
 
-            for device in devices.findChilds("device"):
-                user, _, deviceN, server = splitJid(device['jid'])
-                if deviceN != meDeviceN:
-                    deviceList.append(device['jid'])
+            for participant in participants:
+                yield maybeDeferred(
+                    signalStore.removeSenderKey,
+                    SenderKeyName.create(groupId, participant.split("@")[0]))
 
-            for jid in conn.authState.syncedDevice['devices']:
-                if jid not in deviceList:
-                    yield conn.authState.store.removeSession(jid.split("@")[0], 1)
 
-            conn.authState['syncedDevice']['devices'] = deviceList
+        elif child.tag == "add":
+            participant = child.findChild("participant")
+            p = GroupParticipant(**participant.attributes)
+            yield maybeDeferred(groupStore.storeGroupParticipant, groupId, p)
+
+        elif child.tag == "create":
+            yield addGroupInfo(conn, child.findChild("group"))

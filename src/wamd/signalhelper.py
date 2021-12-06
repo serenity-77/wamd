@@ -29,6 +29,7 @@ from axolotl.groups.groupsessionbuilder import GroupSessionBuilder
 from axolotl.protocol.senderkeymessage import SenderKeyMessage
 from axolotl.protocol.senderkeydistributionmessage import SenderKeyDistributionMessage
 from axolotl.axolotladdress import AxolotlAddress
+from axolotl.util.keyhelper import KeyHelper
 
 
 @inlineCallbacks
@@ -98,6 +99,28 @@ def encrypt(signalStore, paddedMessage, recipientId, deviceId=1):
 
 
 @inlineCallbacks
+def groupEncrypt(signalStore, groupId, participantId, paddedPlaintext):
+    senderKeyName = SenderKeyName.create(groupId, participantId)
+    try:
+        record = yield maybeDeferred(signalStore.loadSenderKey, senderKeyName)
+        senderKeyState = record.getSenderKeyState()
+        senderKey = senderKeyState.getSenderChainKey().getSenderMessageKey()
+        ciphertext = _getGroupCipherText(senderKey.getIv(), senderKey.getCipherKey(), paddedPlaintext)
+
+        senderKeyMessage = SenderKeyMessage(senderKeyState.getKeyId(),
+                                            senderKey.getIteration(),
+                                            ciphertext,
+                                            senderKeyState.getSigningKeyPrivate())
+
+        senderKeyState.setSenderChainKey(senderKeyState.getSenderChainKey().getNext())
+        yield maybeDeferred(signalStore.storeSenderKey, senderKeyName, record)
+
+        return senderKeyMessage.serialize()
+    except InvalidKeyIdException as e:
+        raise NoSessionException(e)
+
+
+@inlineCallbacks
 def _decryptPkMsg(signalStore, message, recipientId, deviceId):
     sessionRecord = yield maybeDeferred(
         signalStore.loadSession, recipientId, deviceId)
@@ -154,7 +177,6 @@ def _process(signalStore, sessionRecord, message, recipientId):
 @inlineCallbacks
 def _processV3(signalStore, sessionRecord, message):
     if sessionRecord.hasSessionState(message.getMessageVersion(), message.getBaseKey().serialize()):
-        # logger.warn("We've already setup a session for this V3 message, letting bundled message fall through...")
         return None
 
     if sessionRecord.hasSessionState(
@@ -365,6 +387,32 @@ def processSenderKeyDistributionMessage(signalStore, groupId, participantId, skM
 
 
 @inlineCallbacks
+def getOrCreateSenderKeyDistributionMessage(signalStore, groupId, participantId):
+    senderKeyName = SenderKeyName.create(groupId, participantId)
+
+    try:
+        senderKeyRecord = yield maybeDeferred(signalStore.loadSenderKey, senderKeyName)
+
+        if senderKeyRecord.isEmpty():
+            senderKeyRecord.setSenderKeyState(KeyHelper.generateSenderKeyId(),
+                                            0,
+                                            KeyHelper.generateSenderKey(),
+                                            KeyHelper.generateSenderSigningKey());
+
+            yield maybeDeferred(
+                signalStore.storeSenderKey, senderKeyName, senderKeyRecord);
+
+        state = senderKeyRecord.getSenderKeyState();
+
+        return SenderKeyDistributionMessage(state.getKeyId(),
+                                            state.getSenderChainKey().getIteration(),
+                                            state.getSenderChainKey().getSeed(),
+                                            state.getSigningKeyPublic());
+    except (InvalidKeyException, InvalidKeyIdException) as e:
+        raise AssertionError(e)
+
+
+@inlineCallbacks
 def _decryptSkMsg(signalStore, senderKeyMessageBytes, senderKeyName):
     try:
         record = yield maybeDeferred(
@@ -380,7 +428,7 @@ def _decryptSkMsg(signalStore, senderKeyMessageBytes, senderKeyName):
 
         senderKey = _getSenderKey(senderKeyState, senderKeyMessage.getIteration())
 
-        plaintext = _getSenderKeyText(senderKey.getIv(), senderKey.getCipherKey(), senderKeyMessage.getCipherText())
+        plaintext = _getGroupPlainText(senderKey.getIv(), senderKey.getCipherKey(), senderKeyMessage.getCipherText())
 
         yield maybeDeferred(signalStore.storeSenderKey, senderKeyName, record)
 
@@ -410,12 +458,7 @@ def _getSenderKey(senderKeyState, iteration):
     return senderChainKey.getSenderMessageKey()
 
 
-def _getSenderKeyText(iv, key, ciphertext):
-    """
-    :type iv: bytearray
-    :type key: bytearray
-    :type ciphertext: bytearray
-    """
+def _getGroupPlainText(iv, key, ciphertext):
     try:
         cipher = AESCipher(key, iv)
         plaintext = cipher.decrypt(ciphertext)
@@ -423,8 +466,18 @@ def _getSenderKeyText(iv, key, ciphertext):
     except Exception as e:
         raise InvalidMessageException(e)
 
+def _getGroupCipherText(iv, key, plaintext):
+    cipher = AESCipher(key, iv)
+    return cipher.encrypt(plaintext)
 
 class SenderKeyName(BaseSenderKeyName):
 
+    def serialize(self):
+        return "%s:%s:%s" % (self.groupId, self.sender.getName(), self.sender.getDeviceId())
+
     def __str__(self):
         return self.serialize()
+
+    @classmethod
+    def create(cls, groupId, recipientId):
+        return cls(groupId, AxolotlAddress(recipientId, 1))

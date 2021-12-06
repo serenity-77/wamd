@@ -468,3 +468,7 @@ def isJidSameUser(jid1, jid2):
 def isGroupJid(jid):
     user, _, _, server = splitJid(jid)
     return "-" in user or server == "g.us"
+
+def jidNormalize(jid):
+    user, _, _, server = splitJid(jid)
+    return "%s@%s" % (user, server)

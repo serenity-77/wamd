@@ -1,5 +1,6 @@
 import base64
 
+from twisted.internet.defer import inlineCallbacks, maybeDeferred
 from twisted.logger import Logger
 from axolotl.ecc import curve, djbec
 
@@ -8,31 +9,32 @@ from wamd.proto import WAMessage_pb2
 from wamd.utils import hmacValidate
 
 from .base import NodeHandler
-
+from wamd.iface import ISignalStore
+from wamd.constants import Constants
 
 
 class IqHandler(NodeHandler):
 
     log = Logger()
 
+    @inlineCallbacks
     def handleNode(self, conn, node):
-        if node['type'] == "set":
-            if not conn._authDone():
-                self._handlePairing(conn, node)
-        else:
-            pending = self.getPendingRequestDeferred(conn, node['id'])
-            if pending:
-                pending.callback(node)
+        pending = self.getPendingRequestDeferred(conn, node['id'])
+        if pending:
+            pending.callback(node)
+        elif not conn._authDone():
+            yield self._handlePairing(conn, node)
 
+    @inlineCallbacks
     def _handlePairing(self, conn, node):
-        if node.children[0].tag == "pair-device":
-            # TODO
-            # reload qr from ref list
+        child = node.getChild()
+
+        if child.tag == "pair-device":
             refNodes = node.children[0].getChilds("ref")
 
             conn.sendMessageNode(Node(
                 "iq", attributes={
-                    'to': "@s.whatsapp.net",
+                    'to': Constants.S_WHATSAPP_NET,
                     'type': "result",
                     'id': node['id']
                 }
@@ -40,7 +42,7 @@ class IqHandler(NodeHandler):
 
             conn._startQrLoop([ref.content for ref in refNodes])
 
-        elif node.children[0].tag == "pair-success":
+        elif child.tag == "pair-success":
             conn._stopQrLoop()
 
             c = node.children[0].findChild("device-identity")
@@ -61,9 +63,12 @@ class IqHandler(NodeHandler):
             signedDeviceIdentity = WAMessage_pb2.ADVSignedDeviceIdentity()
             signedDeviceIdentity.ParseFromString(signedDeviceIdentityHmac.details)
 
+            signalStore = ISignalStore(conn.authState)
+            identityKeyPair = yield maybeDeferred(signalStore.getIdentityKeyPair)
+
             signedDeviceIdentityMsg = b"\x06\x00" + \
                 signedDeviceIdentity.details + \
-                conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey()
+                identityKeyPair.getPublicKey().getPublicKey().getPublicKey()
 
             if not curve.Curve.verifySignature(
                 djbec.DjbECPublicKey(signedDeviceIdentity.accountSignatureKey),
@@ -74,11 +79,11 @@ class IqHandler(NodeHandler):
 
             deviceMessage = b"\x06\x01" + \
                 signedDeviceIdentity.details + \
-                conn.authState.identityKey.getPublicKey().getPublicKey().getPublicKey() + \
+                identityKeyPair.getPublicKey().getPublicKey().getPublicKey() + \
                 signedDeviceIdentity.accountSignatureKey
 
             signedDeviceIdentity.deviceSignature = curve.Curve.calculateSignature(
-                conn.authState.identityKey.getPrivateKey(),
+                identityKeyPair.getPrivateKey(),
                 deviceMessage
             )
 

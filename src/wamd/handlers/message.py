@@ -4,6 +4,7 @@ from twisted.python.failure import Failure
 from axolotl.invalidkeyidexception import InvalidKeyIdException
 from axolotl.invalidmessageexception import InvalidMessageException
 from axolotl.duplicatemessagexception import DuplicateMessageException
+from axolotl.nosessionexception import NoSessionException
 
 from .base import NodeHandler
 from wamd.coder import Node
@@ -21,6 +22,7 @@ from wamd.utils import (
 )
 from wamd.http import downloadMediaAndDecrypt
 from wamd.messages import WhatsAppMessage
+from wamd.iface import ISignalStore
 
 
 class MessageHandler(NodeHandler):
@@ -65,19 +67,20 @@ class MessageHandler(NodeHandler):
 
         try:
             plainText = yield signalDecrypt(
-                conn.authState.store,
+                ISignalStore(conn.authState),
                 encNode.content,
                 recipientId,
                 groupId=groupId,
                 type=encNode['type'])
-        except (InvalidKeyIdException, InvalidMessageException) as ex:
+        except (InvalidKeyIdException, InvalidMessageException, NoSessionException) as e:
             self.log.warn("Incoming Message [{messageId}] Decrypt Failed, message={message}, Going to send retry request",
-                messageId=node['id'], message=str(ex))
-            # TODO
-            # send receipt
-            # If exception is InvalidKeyIdException, maybe request a retry
+                messageId=node['id'], message=str(e))
+
+            # Send retry receipt
+            yield conn._sendRetryReceiptRequest(node)
         except DuplicateMessageException:
-            # From Yowsup
+            # From Yowsup, maybe because the same message cannot be
+            # decrypted using the same session.
             self.log.warn("Received a message that we've previously decrypted")
         except:
             self.log.error("Decrypt Failure {failure}", failure=Failure())
@@ -96,11 +99,18 @@ class MessageHandler(NodeHandler):
                 yield self._handleSenderKeyDistributionMessage(
                     conn, node, messageProto.senderKeyDistributionMessage)
 
-                # remove the pkmsg/msg child first after processing sender key
-                # distribution message, and then repeat the call to self.handleNode
-                # so that it decrypt the actual skmsg message.
                 node.removeChild(encNode)
-                yield self.handleNode(conn, node)
+                if node.findChild("enc"):
+                    # remove the pkmsg/msg child first after processing sender key
+                    # distribution message, and then repeat the call to self.handleNode
+                    # so that it decrypt the actual skmsg message.
+                    yield self.handleNode(conn, node)
+                else:
+                    # this maybe a retry message that we had requested.
+                    # A retry message doesn't have an skmsg enc.
+                    # Hufttt!!!
+                    yield maybeDeferred(self._sendReceipt, conn, node)
+                    self._handleIncomingMessage(conn, messageProto, node=node)
                 return
             else:
                 yield maybeDeferred(self._sendReceipt, conn, node)
@@ -119,7 +129,7 @@ class MessageHandler(NodeHandler):
     @inlineCallbacks
     def _handleSenderKeyDistributionMessage(self, conn, node, senderKeyDistributionMessage):
         yield processSenderKeyDistributionMessage(
-            conn.authState.store,
+            ISignalStore(conn.authState),
             senderKeyDistributionMessage.groupId.split("@")[0],
             node['participant'].split("@")[0],
             senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage)
@@ -142,7 +152,7 @@ class MessageHandler(NodeHandler):
         ):
             if historySync.conversations:
                 for conversation in historySync.conversations:
-                    unreadCount = conversation.unreadCount
+                    unreadCount = conversation.unreadCount - 1
                     for historySyncMsg in conversation.messages:
                         webMessageInfoProto = historySyncMsg.message
                         isRead = True
@@ -152,15 +162,14 @@ class MessageHandler(NodeHandler):
                         self._handleIncomingMessage(conn, webMessageInfoProto, isRead=isRead)
 
     def _handleIncomingMessage(self, conn, messageProto, node=None, isRead=False):
-        if (
-            not isinstance(messageProto, WAMessage_pb2.WebMessageInfo) and
-            messageProto.HasField("deviceSentMessage")
-        ):
-            messageProto = messageProto.deviceSentMessage
-
         if not isinstance(messageProto, WAMessage_pb2.WebMessageInfo):
             messageKey = WAMessage_pb2.MessageKey()
-            messageKey.remoteJid = node['from']
+
+            if messageProto.HasField("deviceSentMessage"):
+                messageKey.remoteJid = messageProto.deviceSentMessage.destinationJid
+                messageProto = messageProto.deviceSentMessage.message
+            else:
+                messageKey.remoteJid = node['from']
 
             if isGroupJid(node['from']):
                 sender = node['participant']
