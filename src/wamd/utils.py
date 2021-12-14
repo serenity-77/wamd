@@ -121,6 +121,47 @@ def mediaTypeFromMime(mime):
 
     return mediaType
 
+def mediaTypeFromMessageProto(messageProto):
+    if messageProto.HasField("imageMessage"):
+        mediaType = "image"
+    elif messageProto.HasField("videoMessage"):
+        mediaType = "video"
+    elif messageProto.HasField("documentMessage"):
+        mediaType = "document"
+    elif messageProto.HasField("audioMessage"):
+        mediaType = "audio"
+    elif messageProto.HasField("stickerMessage"):
+        mediaType = "image"
+    else:
+        raise ValueError("Unsupported media key name: %s" % (mediaKeyName, ))
+
+    return mediaType
+
+def messageTypeFromProto(messageProto):
+    if messageProto.conversation:
+        messageType = "text"
+    elif messageProto.HasField("imageMessage"):
+        messageType = "media"
+    elif messageProto.HasField("videoMessage"):
+        messageType = "media"
+    elif messageProto.HasField("documentMessage"):
+        messageType = "media"
+    elif messageProto.HasField("audioMessage"):
+        messageType = "audio"
+    elif messageProto.HasField("stickerMessage"):
+        messageType = "media"
+    elif messageProto.HasField("contactMessage"):
+        messageType = "contact"
+    elif messageProto.HasField("locationMessage"):
+        messageType = "location"
+    elif messageProto.HasField("imageMessage"):
+        messageType = "media"
+    elif messageProto.HasField("extendedTextMessage"):
+        messageType = "text"
+    else:
+        raise ValueError("Unsupported message type")
+    return messageType
+
 
 def addSupportedMimeType(mime, type):
     if type == "image":

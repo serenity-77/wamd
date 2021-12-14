@@ -11,7 +11,8 @@ from axolotl.util.keyhelper import KeyHelper
 from .iface import (
     IJsonSerializableStore,
     ISignalStore,
-    IGroupStore
+    IGroupStore,
+    IMessageStore
 )
 
 
@@ -26,7 +27,8 @@ _INITIAL_ATTRIBUTES = [
 
 _STORE_INTERFACES = {
     '__SIGNALSTORE__': ISignalStore,
-    '__GROUPSTORE__': IGroupStore
+    '__GROUPSTORE__': IGroupStore,
+    '__MESSAGESTORE__': IMessageStore
 }
 
 
@@ -39,16 +41,19 @@ class AuthState(Componentized):
         from .store.default import (
             DefaultMemorySignalStore,
             DefaultMemoryGroupStore,
-            DefaultCachedMediaStore
+            DefaultCachedMediaStore,
+            DefaultMessageStore
         ) # Cyclic import
 
         defaultSignalStore = DefaultMemorySignalStore()
         defaultGroupStore = DefaultMemoryGroupStore()
         defaultCachedMediaStore = DefaultCachedMediaStore()
+        defaultMessageStore = DefaultMessageStore()
 
         self.addStoreComponent(defaultSignalStore)
         self.addStoreComponent(defaultGroupStore)
         self.addStoreComponent(defaultCachedMediaStore)
+        self.addStoreComponent(defaultMessageStore)
 
     @inlineCallbacks
     def initKeys(self):

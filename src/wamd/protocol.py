@@ -46,7 +46,6 @@ from .errors import (
     AuthenticationFailedError,
     StreamEndError,
     NodeStreamError,
-    SendMessageError,
     WAMDError
 )
 from .coder import WABinaryReader, WABinaryWriter, Node
@@ -65,6 +64,8 @@ from .utils import (
     sha256Hash,
     mimeTypeFromBuffer,
     mediaTypeFromMime,
+    mediaTypeFromMessageProto,
+    messageTypeFromProto,
     encryptMedia,
     processImage,
     addRandomPadding,
@@ -73,7 +74,11 @@ from .utils import (
 from .handlers import createNodeHandler
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
-from .messages import WhatsAppMessage, TextMessage, MediaMessage
+from .messages import (
+    WhatsAppMessage,
+    TextMessage,
+    MediaMessage
+)
 from .signalhelper import (
     processPreKeyBundle,
     encrypt as signalEncrypt,
@@ -82,7 +87,12 @@ from .signalhelper import (
 )
 from .http import request as doHttpRequest
 from .common import AuthState
-from .iface import ISignalStore, ICachedMediaStore, IGroupStore
+from .iface import (
+    ISignalStore,
+    ICachedMediaStore,
+    IGroupStore,
+    IMessageStore
+)
 from .conn_utils import getUsyncDeviceList
 
 
@@ -118,7 +128,6 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         self.reactor = reactor
         self._pendingRequest = {}
-
 
     def onOpen(self):
         self.log.info("Connected to whatsapp server: {peer}", peer=self.transport.getPeer())
@@ -527,7 +536,6 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         # TODO
         # Implement queue/locking.
         # So that only one message can be sent at a time.
-
         if not isinstance(message, WhatsAppMessage):
             return fail(
                 TypeError("Must be an instance of %s" % qual(WhatsAppMessage))
@@ -547,17 +555,59 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         # TODO
         # Before sending to group, maybe check if group exists
 
+        messageStore = IMessageStore(self.authState)
+        messageStored = [False]
+
+        @inlineCallbacks
         def onProcessMessageDone(messageNode):
-            # Ignore message ack, Just passthrough
-            return self.request(messageNode).addCallback(
-                lambda _: message)
+            webMessageInfoProto = WAMessage_pb2.WebMessageInfo()
+            messageKey = WAMessage_pb2.MessageKey()
+            messageKey.remoteJid = message['to']
+            messageKey.fromMe = True
+            messageKey.id = message['id']
 
-        return d.addCallback(onProcessMessageDone)
+            webMessageInfoProto.key.MergeFrom(messageKey)
+            webMessageInfoProto.message.MergeFrom(message.toProtobufMessage())
 
+            yield messageStore.storeMessage(message['id'], webMessageInfoProto)
+
+            messageStored[0] = True
+
+            responseAck = yield self.request(messageNode)
+
+            @inlineCallbacks
+            def _maybeFlagSenderKeys():
+                participants = messageNode.findChild("participants")
+                if not participants:
+                    return
+                groupStore = IGroupStore(self.authState)
+                groupId = message['to'].split("@")[0]
+                try:
+                    for toNode in participants.findChilds("to"):
+                        yield maybeDeferred(groupStore.flagSenderKey, groupId, toNode['jid'])
+                except:
+                    pass
+
+            if isGroupJid(message['to']):
+                self.reactor.callLater(0, _maybeFlagSenderKeys)
+
+            return message
+
+        @inlineCallbacks
+        def errback(f):
+            if messageStored[0]:
+                yield messageStore.removeMessage(
+                    "%s%s" % (Constants.MESSAGE_STORE_RETRY_PREFIX, message['id']))
+            return f
+
+        return d.addCallback(onProcessMessageDone).addErrback(errback)
+
+    # sendMessage used by WebSocketClientProtocol
+    relayMessage = sendMsg
 
     def _processTextMessage(self, message):
         if not message['conversation']:
-            return fail(SendMessageError("conversation parameters required"))
+             return fail(ValueError("conversation parameters required"))
         return self._makeMessageNode(message, "text")
 
     @inlineCallbacks
@@ -567,7 +617,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             try:
                 fileContent = yield doHttpRequest(message['url'])
             except:
-                raise SendMessageError("Failed to download media from %s\n%s" % (message['url'], Failure()))
+                raise WAMDError("Failed to download media from %s\n%s" % (message['url'], Failure()))
         else:
             if not os.path.exists(message['url']):
                 raise FileNotFoundError("File %s not found" % (message['url']))
@@ -722,7 +772,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     def _usyncQuery(self, jids, context):
         if not jids:
-            return fail("jids required in usync query")
+            return fail(ValueError("jids required in usync query"))
 
         iqNode = Node("iq", {
             'to': Constants.S_WHATSAPP_NET,
@@ -743,7 +793,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         return self.request(iqNode)
 
     @inlineCallbacks
-    def _makeMessageNode(self, message, messageType, mediaType=None):
+    def _makeMessageNode(self, message, messageType, mediaType=None, retryCount=None):
         isGroup = isGroupJid(message['to'])
 
         messageNode = Node("message", {
@@ -757,7 +807,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         signalStore = ISignalStore(self.authState)
 
         @inlineCallbacks
-        def _ensureSession(recipients):
+        def _ensureE2ESession(recipients):
             if not recipients:
                 return
             keyRequestJids = []
@@ -810,7 +860,6 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             for p in deviceParticipants:
                 if p not in flaggedSenderKeys:
                     recipients.append(p)
-                    yield maybeDeferred(groupStore.flagSenderKey, groupId, p)
 
         else:
             usyncJids = [message['to'], jidNormalize(self.authState.me['jid'])]
@@ -819,7 +868,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         participantsNode = None
         skMsgNode = None
 
-        yield _ensureSession(recipients)
+        yield _ensureE2ESession(recipients)
 
         if isGroup:
             participantId = self.authState.me['jid'].split("@")[0]
@@ -864,8 +913,6 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
                 skMsgNode['mediatype'] = mediaType
 
         else:
-            yield _ensureSession(recipients)
-
             deviceSentMessageProto = WAMessage_pb2.DeviceSentMessage()
             deviceSentMessageProto.destinationJid = message['to']
             deviceSentMessageProto.message.MergeFrom(messageProto)
@@ -911,6 +958,59 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         return messageNode
 
+
+    @inlineCallbacks
+    def _makeRetryMessageNode(self, webMessageInfoProto, retryCount):
+        messageProto = webMessageInfoProto.message
+        messageType = messageTypeFromProto(messageProto)
+
+        if webMessageInfoProto.key.participant:
+            recipientId = webMessageInfoProto.key.participant.split("@")[0]
+
+            skMessage = yield getOrCreateSenderKeyDistributionMessage(
+                ISignalStore(self.authState),
+                webMessageInfoProto.key.remoteJid.split("@")[0],
+                self.authState.me['jid'].split("@")[0])
+
+            skMessageProto = WAMessage_pb2.SenderKeyDistributionMessage()
+            skMessageProto.groupId = webMessageInfoProto.key.remoteJid
+            skMessageProto.axolotlSenderKeyDistributionMessage = skMessage.serialize()
+
+            messageProto.senderKeyDistributionMessage.MergeFrom(skMessageProto)
+
+        else:
+            recipientId = webMessageInfoProto.key.remoteJid.split("@")[0]
+
+        type, cipherText = yield signalEncrypt(
+            ISignalStore(self.authState),
+            addRandomPadding(messageProto.SerializeToString()),
+            recipientId)
+
+        encNode = Node("enc", {
+            'v': "2",
+            'type': type,
+            'count': str(retryCount)
+        }, cipherText)
+
+        if messageType == "media":
+            mediaType = mediaTypeFromMessageProto(messageProto)
+            encNode['mediatype'] = mediaType
+
+        messageNode = Node("message", {
+            'id': webMessageInfoProto.key.id,
+            'to': webMessageInfoProto.key.remoteJid,
+            'type': messageType
+        }, encNode)
+
+        if webMessageInfoProto.key.participant:
+            messageNode['participant'] = webMessageInfoProto.key.participant
+
+        if encNode['type'] == "pkmsg":
+            messageNode.addChild(self._buildDeviceIdentityNode())
+
+        return messageNode
+
+
     @inlineCallbacks
     def _requestPreKeyBundles(self, jids):
         if not isinstance(jids, list):
@@ -934,19 +1034,22 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         preKeyBundles = {}
 
-        for userNode in resultNode.getChild("list").getChilds("user"):
+        for userNode in resultNode.findChild("list").findChilds("user"):
             signedPreKeyNode = userNode.findChild("skey")
             preKeyNode = userNode.findChild("key")
-            # TODO
-            # handle if preKeyNode is None
+
             registrationId = decodeUint(userNode.findChild("registration").content, 4)
             identityKey = IdentityKey(djbec.DjbECPublicKey(userNode.findChild("identity").content))
             signedPreKeyId = decodeUint(signedPreKeyNode.findChild("id").content, 3)
-            signedPreKeyPublic = djbec.DjbECPublicKey(signedPreKeyNode.getChild("value").content)
-            signedPreKeySignature = signedPreKeyNode.getChild("signature").content
+            signedPreKeyPublic = djbec.DjbECPublicKey(signedPreKeyNode.findChild("value").content)
+            signedPreKeySignature = signedPreKeyNode.findChild("signature").content
 
-            preKeyId = decodeUint(preKeyNode.findChild("id").getContent(), 3)
-            preKeyPublic = djbec.DjbECPublicKey(preKeyNode.getChild("value").content)
+            if preKeyNode is None:
+                preKeyId = None
+                preKeyPublic = None
+            else:
+                preKeyId = decodeUint(preKeyNode.findChild("id").getContent(), 3)
+                preKeyPublic = djbec.DjbECPublicKey(preKeyNode.findChild("value").content)
 
             preKeyBundles[userNode['jid']] = PreKeyBundle(
                 registrationId, 1, preKeyId, preKeyPublic,

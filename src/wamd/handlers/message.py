@@ -52,7 +52,9 @@ class MessageHandler(NodeHandler):
         encNode = node.findChild("enc")
 
         if encNode is None:
-            # Unavailable content
+            # Unavailable content <unavailable></unavailable>
+            # Maybe this should also be retried???
+            self._sendReceipt(conn, node)
             return
 
         if encNode['type'] != "skmsg":
@@ -111,7 +113,6 @@ class MessageHandler(NodeHandler):
                     # Hufttt!!!
                     yield maybeDeferred(self._sendReceipt, conn, node)
                     self._handleIncomingMessage(conn, messageProto, node=node)
-                return
             else:
                 yield maybeDeferred(self._sendReceipt, conn, node)
                 self._handleIncomingMessage(conn, messageProto, node=node)
@@ -152,7 +153,10 @@ class MessageHandler(NodeHandler):
         ):
             if historySync.conversations:
                 for conversation in historySync.conversations:
-                    unreadCount = conversation.unreadCount - 1
+                    if historySync.syncType == WAMessage_pb2.HistorySyncNotification.INITIAL_BOOTSTRAP:
+                        unreadCount = conversation.unreadCount
+                    else:
+                        unreadCount = 0
                     for historySyncMsg in conversation.messages:
                         webMessageInfoProto = historySyncMsg.message
                         isRead = True

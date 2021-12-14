@@ -1,13 +1,15 @@
 import sys
 import pyqrcode
 import png # Guard for pyqrcode
+import json
 
 from io import BytesIO
 
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
+from twisted.python.filepath import FilePath
 
-from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClientProtocol
+from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
 
 
 from twisted.logger import (
@@ -30,7 +32,19 @@ globalLogPublisher.addObserver(
 def protocolFactory():
     # Do any initialization here, such as reading session file
     # to be supplied to the protocol/connection.
-    return MultiDeviceWhatsAppClientProtocol()
+    authState = AuthState()
+    sessionPath = FilePath("session.json")
+    if sessionPath.exists():
+        try:
+            with open(sessionPath.path, "r") as f:
+                session = json.loads(f.read())
+                authState.populateFromJson(session)
+        except:
+            raise
+    else:
+        authState = None
+
+    return MultiDeviceWhatsAppClient(authState)
 
 
 def handleQr(qrInfo):

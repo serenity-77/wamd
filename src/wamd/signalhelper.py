@@ -3,7 +3,9 @@ A Wrapper around axolotl cipher that maybe use
 an async storage.
 
 Literally everything is copied from python-axolotl
+https://github.com/tgalal/python-axolotl
 """
+
 
 from twisted.internet.defer import maybeDeferred, inlineCallbacks
 from twisted.python.reflect import qual
@@ -30,6 +32,11 @@ from axolotl.protocol.senderkeymessage import SenderKeyMessage
 from axolotl.protocol.senderkeydistributionmessage import SenderKeyDistributionMessage
 from axolotl.axolotladdress import AxolotlAddress
 from axolotl.util.keyhelper import KeyHelper
+
+# TODO
+# This could be implemented using proxy method or class
+# to proxy all calls to axolotl, instead of copying everything
+# like a PSYCHOPATH!!!
 
 
 @inlineCallbacks

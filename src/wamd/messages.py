@@ -16,7 +16,10 @@ from wamd.utils import (
 from wamd.constants import Constants
 
 
+
 class WhatsAppMessage:
+
+    messageType = None
 
     def __init__(self, **kwargs):
         self._attrs = {}
@@ -61,6 +64,9 @@ class WhatsAppMessage:
     def toProtobufMessage(self):
         raise NotImplementedError("%s must be implemented in child class" % qual(self.toProtobufMessage))
 
+    def populateFromMessage(self, message):
+        pass
+
     _STR_INDENT = "    "
     _TEXT_LIMIT = 50
 
@@ -96,13 +102,12 @@ class WhatsAppMessage:
             o += "%sConversation: %s\n" % (indent, self['conversation'][:self.__class__._TEXT_LIMIT] + "..." if len(self['conversation']) > self.__class__._TEXT_LIMIT else self['conversation'])
 
         elif isinstance(self, MediaMessage):
-            o += "%sMediaType: %s\n" % (indent, self['mediaType'])
             o += "%sMime: %s\n" % (indent, self['mimetype'])
             if self['url'] is not None:
                 o += "%sUrl: %s\n" % (indent, self['url'])
             else:
                 o += "%sDirectPath: %s\n" % (indent, self['directPath'])
-            if self['caption'] is not None and self['mediaType'] in ["image", "video"]:
+            if self['caption'] is not None:
                 o += "%sCaption: %s\n" % (indent, self['caption'][:self.__class__._TEXT_LIMIT] + "..." if len(self['caption']) > self.__class__._TEXT_LIMIT else self['caption'])
             if self['fileName'] is not None:
                 o += "%sFileName: %s\n" % (indent, self['fileName'])
@@ -173,8 +178,6 @@ class WhatsAppMessage:
                     if messageType in message:
                         if klass is not None:
                             attributes.update(message[messageType])
-                            if messageType in _SUPPORTED_MEDIA_KEYS:
-                                attributes['mediaType'] = mediaTypeFromMime(message[messageType]['mimetype'])
                             cls = klass
                         else:
                             raise NotImplementedError("Message Type [%s] Not Implemented" % (messageType, ))
@@ -182,7 +185,12 @@ class WhatsAppMessage:
         else:
             cls = ProtocolMessage
 
-        return cls(**attributes)
+        messageObj = cls(**attributes)
+
+        if message is not None:
+            messageObj.populateFromMessage(message)
+
+        return messageObj
 
     def __repr__(self):
         return "\n<%s Object at 0x%x %s>\n" % (self.__class__.__name__, id(self), self._attrs.__repr__())
@@ -190,6 +198,9 @@ class WhatsAppMessage:
 
 
 class TextMessage(WhatsAppMessage):
+
+    def populateFromMessage(self, message):
+        self['conversation'] = message['conversation']
 
     def toProtobufMessage(self):
         messageProto = WAMessage_pb2.Message()
@@ -199,8 +210,18 @@ class TextMessage(WhatsAppMessage):
 
 class MediaMessage(WhatsAppMessage):
 
+    def populateFromMessage(self, message):
+        key = None
+        for _key in _MEDIA_KEYS_MESSAGE:
+            if _key in message:
+                key = _key
+                break
+        mediaMessage = message[key]
+        for k, v in mediaMessage.items():
+            self[k] = v
+
     def toProtobufMessage(self):
-        mediaType = self['mediaType']
+        mediaType = mediaTypeFromMime(self['mimetype'])
 
         if mediaType == "image":
             protoFactory = WAMessage_pb2.ImageMessage
@@ -225,12 +246,35 @@ class MediaMessage(WhatsAppMessage):
 class StickerMessage(MediaMessage):
     pass
 
-
 class ExtendedTextMessage(WhatsAppMessage):
     pass
 
-
 class TemplateMessage(WhatsAppMessage):
+
+    def populateFromMessage(self, message):
+        for k, v in message['templateMessage'].items():
+            self[k] = v
+
+
+class TemplateButtonReplyMessage(WhatsAppMessage):
+    pass
+
+
+class ButtonsMessage(WhatsAppMessage):
+    pass
+
+
+class ContactMessage(WhatsAppMessage):
+    pass
+
+class ContactsArrayMessage(WhatsAppMessage):
+    pass
+
+class LiveLocationMessage(WhatsAppMessage):
+    pass
+
+
+class LocationMessage(WhatsAppMessage):
     pass
 
 
@@ -241,22 +285,21 @@ class ProtocolMessage(WhatsAppMessage):
 
 _MESSAGE_TYPE_CLASS_MAPS = {
     'imageMessage': MediaMessage,
-    'contactMessage': None,
-    'locationMessage': None,
+    'contactMessage': ContactMessage,
+    'locationMessage': LocationMessage,
     'extendedTextMessage': ExtendedTextMessage,
     'documentMessage': MediaMessage,
     'audioMessage': MediaMessage,
     'videoMessage': MediaMessage,
-    'contactsArrayMessage': None,
-    'liveLocationMessage': None,
+    'contactsArrayMessage': ContactsArrayMessage,
+    'liveLocationMessage': LiveLocationMessage,
     'templateMessage': TemplateMessage,
     'stickerMessage': StickerMessage,
-    'groupInviteMessage': None,
-    'buttonsMessage': None,
-    'templateButtonReplyMessage': None
+    'buttonsMessage': ButtonsMessage,
+    'templateButtonReplyMessage': TemplateButtonReplyMessage
 }
 
-_SUPPORTED_MEDIA_KEYS = [
+_MEDIA_KEYS_MESSAGE = [
     "imageMessage",
     "videoMessage",
     "documentMessage",

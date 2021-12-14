@@ -107,6 +107,9 @@ class IGroupStore(Interface):
     def getAllFlaggedSenderKeys(groupId):
         pass
 
+    def removeAllFlaggedSenderKeys(groupId):
+        pass
+
 
 class ICachedMediaStore(Interface):
 
@@ -114,4 +117,23 @@ class ICachedMediaStore(Interface):
         pass
 
     def getCachedMedia(self, key):
+        pass
+
+
+class IMessageStore(Interface):
+    """
+    Only used as a cache for message that
+    needs to be retried.
+    """
+
+    def storeMessage(id, message):
+        pass
+
+    def getMessage(id):
+        pass
+
+    def removeMessage(id):
+        pass
+
+    def getAllMessageId():
         pass

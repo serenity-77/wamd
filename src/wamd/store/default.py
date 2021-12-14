@@ -16,11 +16,13 @@ from wamd.iface import (
     ISignalStore,
     IJsonSerializableStore,
     IGroupStore,
-    ICachedMediaStore
+    ICachedMediaStore,
+    IMessageStore
 )
 
 from wamd.common import GroupInfo, GroupParticipant
 from wamd.utils import splitJid
+from wamd.proto import WAMessage_pb2
 
 
 @implementer(ISignalStore, IJsonSerializableStore)
@@ -287,6 +289,12 @@ class DefaultMemoryGroupStore:
             return []
         return p
 
+    def removeAllFlaggedSenderKeys(self, groupId):
+        try:
+            del self._senderKeyFlags[groupId]
+        except KeyError:
+            pass
+
     def toJson(self):
         jsonDict = {}
         if self._groupInfo:
@@ -363,3 +371,55 @@ class DefaultCachedMediaStore:
         del self._cachedMediaStore[key]['delayedCall']
         del self._cachedMediaStore[key]['data']
         del self._cachedMediaStore[key]
+
+
+@implementer(IMessageStore, IJsonSerializableStore)
+class DefaultMessageStore:
+
+    _ID_PREFIX = "__M__:"
+
+    def __init__(self):
+        self._messageStore = {}
+
+    def storeMessage(self, id, message):
+        if isinstance(message, WAMessage_pb2.WebMessageInfo):
+            message = message.SerializeToString()
+        self._messageStore[id] = message
+
+    def getMessage(self, id):
+        try:
+            return self._messageStore[id]
+        except KeyError:
+            pass
+
+    def removeMessage(self, id):
+        try:
+            del self._messageStore[id]
+        except KeyError:
+            pass
+
+    def getAllMessageId(self):
+        return list(self._messageStore.keys())
+
+    def toJson(self):
+        if not self._messageStore:
+            return
+        messages = {}
+        for messageId, message in self._messageStore.items():
+            messages[messageId] = {}
+            if isinstance(message, bytes):
+                messages[messageId] = base64.b64encode(message).decode()
+            else:
+                messages[messageId] = message
+        return messages
+
+    def populate(self, jsonDict):
+        if not jsonDict:
+            return
+
+        for messageId, message in jsonDict.items():
+            self._messageStore[messageId] = {}
+            if isinstance(message, str):
+                self._messageStore[messageId] = base64.b64decode(message)
+            else:
+                self._messageStore[messageId] = message

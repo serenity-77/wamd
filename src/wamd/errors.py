@@ -41,10 +41,5 @@ class NodeStreamError(WAMDError):
         WAMDError.__init__(self, m)
 
 
-
-class SendMessageError(WAMDError):
-    pass
-
-
 class IqRequestError(WAMDError):
     pass

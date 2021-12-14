@@ -20,6 +20,7 @@ class Constants:
     S_WHATSAPP_NET = "@s.whatsapp.net"
     G_US = "@g.us"
     MAX_PREKEYS_UPLOAD = 30
+    MESSAGE_STORE_RETRY_PREFIX = "FOR_RETRY-"
 
     IS_LITTLE_ENDIAN = sys.byteorder == "little"
 
