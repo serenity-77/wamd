@@ -4,11 +4,18 @@ import json
 
 from io import BytesIO
 
-# twisted imports
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
+from twisted.internet.task import deferLater
 from twisted.python.filepath import FilePath
 from twisted.python.failure import Failure
+
+
+from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
+from wamd.common import AuthState
+from wamd.messages import TextMessage
+
+
 from twisted.logger import (
     textFileLogObserver,
     FilteringLogObserver,
@@ -17,12 +24,6 @@ from twisted.logger import (
     globalLogPublisher,
     Logger
 )
-
-
-from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
-from wamd.common import AuthState
-
-
 
 
 globalLogPublisher.addObserver(
@@ -73,6 +74,48 @@ def handleQr(qrInfo):
 
 
 @inlineCallbacks
+def handleInbox(connection, message):
+    if not message['fromMe'] and not message['isRead']:
+        log.info("Unread Message: {unreadMessage}", unreadMessage=message)
+
+        # Send Read Receipt
+        yield connection.sendReadReceipt(message)
+
+        # Wait 5 seconds and then reply the message
+        yield deferLater(reactor, 5)
+
+        message = TextMessage(
+            to=message['from'],
+            conversation="What's up?"
+        )
+
+        try:
+            result = yield connection.relayMessage(message)
+        except:
+            log.failure("Send message failure")
+        else:
+            log.info("Result: {result}", result=result)
+
+
+def handleReceipt(connection, receipt):
+    log.info("Got Receipt: {receipt}", receipt=receipt)
+
+
+def handleClose(connection, reason):
+    log.info("Handle Close: {reason}", reason=reason)
+
+    sessionPath = FilePath("session.json")
+    if reason.value.isLoggedOut:
+        try:
+            sessionPath.remove()
+        except:
+            pass
+    else:
+        with open(sessionPath.path, "w") as f:
+            f.write(json.dumps(connection.authState.toJson(), indent=4))
+
+
+@inlineCallbacks
 def onConnect(connection):
     if not connection.authState.has("me"):
         connection.on("qr", handleQr)
@@ -90,6 +133,9 @@ def onConnect(connection):
         log.failure("Login Failure")
     else:
         log.info("Login Success")
+        connection.on("inbox", handleInbox)
+        connection.on("receipt", handleReceipt)
+        connection.on("close", handleClose)
 
 
 
