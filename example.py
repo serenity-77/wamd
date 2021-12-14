@@ -1,6 +1,5 @@
 import sys
 import pyqrcode
-import png # Guard for pyqrcode
 import json
 
 from io import BytesIO
@@ -8,16 +7,19 @@ from io import BytesIO
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 from twisted.python.filepath import FilePath
+from twisted.python.failure import Failure
+
 
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
-
+from wamd.common import AuthState
 
 from twisted.logger import (
     textFileLogObserver,
     FilteringLogObserver,
     LogLevelFilterPredicate,
     LogLevel,
-    globalLogPublisher
+    globalLogPublisher,
+    Logger
 )
 
 
@@ -29,11 +31,13 @@ globalLogPublisher.addObserver(
 )
 
 
+log = Logger()
+
+
 def protocolFactory():
-    # Do any initialization here, such as reading session file
-    # to be supplied to the protocol/connection.
     authState = AuthState()
     sessionPath = FilePath("session.json")
+
     if sessionPath.exists():
         try:
             with open(sessionPath.path, "r") as f:
@@ -50,38 +54,40 @@ def protocolFactory():
 def handleQr(qrInfo):
     # this will require pyqrcode installed
     # or whatever library or package used to
-    # render qr code
+    # render qr code.
 
-    print("\nQR Info: %r" % (qrInfo))
+    log.info("QR Info: {qrInfo}", qrInfo=qrInfo)
+
     qrObj = pyqrcode.create(b",".join(qrInfo), error="L")
     qrIO = BytesIO()
     qrObj.png(qrIO, scale=6)
     qrBytes = qrIO.getvalue()
     qrIO.close()
 
+    # This will create a png file named qr.png
+    # Open it and scan it.
     with open("qr.png", "wb") as qrFileIO:
         qrFileIO.write(qrBytes)
 
 
-def inboxReceiver(connection, message):
-    print("Inbox Message: %s" % (message, ))
-    if not message['fromMe'] and not message['isRead']:
-        connection.sendReadReceipt(message)
-
-
 @inlineCallbacks
 def onConnect(connection):
-    print("\nConnection 1: %r" % (connection, ))
-    connection.on("qr", handleQr)
+    if not connection.authState.has("me"):
+        connection.on("qr", handleQr)
 
-    # the new connection after successfull authentication
-    # will be different than provided the first connection
-    # since the connection will automatically be restarted
-    # after authentication.
-    connection = yield connection.authenticate()
-
-    connection.on("inbox", inboxReceiver)
-    print("\nConnection 2: %r" % (connection, ))
+    try:
+        # On first login (Scanning QR) the connection
+        # returned from connection.authenticate will
+        # be different from the parameter of onConnect.
+        # This is because after successfull pairing the
+        # connection is restarted. So attach any event
+        # to the connection only after successfull call to
+        # connection.authenticate.
+        connection = yield connection.authenticate()
+    except:
+        log.failure("Login Failure")
+    else:
+        log.info("Login Success")
 
 
 
@@ -90,7 +96,7 @@ connectToWhatsAppServer(
 ).addCallback(
     onConnect
 ).addErrback(
-    lambda f: print("\nFailure : %s" % (f, ))
+    lambda f: log.failure("Connect Failure", failure=f)
 )
 
 reactor.run()
