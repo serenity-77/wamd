@@ -4,15 +4,11 @@ import json
 
 from io import BytesIO
 
+# twisted imports
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 from twisted.python.filepath import FilePath
 from twisted.python.failure import Failure
-
-
-from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
-from wamd.common import AuthState
-
 from twisted.logger import (
     textFileLogObserver,
     FilteringLogObserver,
@@ -21,6 +17,12 @@ from twisted.logger import (
     globalLogPublisher,
     Logger
 )
+
+
+from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
+from wamd.common import AuthState
+
+
 
 
 globalLogPublisher.addObserver(
