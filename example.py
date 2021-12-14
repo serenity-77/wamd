@@ -1,6 +1,12 @@
 import sys
-import pyqrcode
 import json
+import pyqrcode
+
+# guard for pyqrcode
+# This is here because this example use pyqrcode
+# which require pypng installed
+import png
+
 
 from io import BytesIO
 
