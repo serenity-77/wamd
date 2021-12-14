@@ -10,18 +10,12 @@ import png
 
 from io import BytesIO
 
+# Twisted Imports
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
 from twisted.internet.task import deferLater
 from twisted.python.filepath import FilePath
 from twisted.python.failure import Failure
-
-
-from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
-from wamd.common import AuthState
-from wamd.messages import TextMessage
-
-
 from twisted.logger import (
     textFileLogObserver,
     FilteringLogObserver,
@@ -30,6 +24,11 @@ from twisted.logger import (
     globalLogPublisher,
     Logger
 )
+
+
+from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
+from wamd.common import AuthState
+from wamd.messages import TextMessage
 
 
 globalLogPublisher.addObserver(
