@@ -1,4 +1,4 @@
-WhatsApp MultiDevice client
+WhatsApp Web Multi Device client API
 
 Literally everything combined from:
 1. https://github.com/adiwajshing/baileys/tree/multi-device
