@@ -9,7 +9,7 @@ Literally everything combined from:
 
 Installation:
 ```shell
- git clone git@github.com:harianjalundu77/wamd.git
+ git clone git@github.com:Serenity-77/wamd.git
  cd wamd
  pip3 install -r requirements.txt
  python3 setup.py install --record install.txt
