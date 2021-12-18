@@ -136,7 +136,7 @@ class WhatsAppMessage:
 
     @staticmethod
     def generateMessageId():
-        return "3EB0" + binascii.hexlify(os.urandom(8)).decode().upper()
+        return binascii.hexlify(os.urandom(23)).decode().upper()
 
     @staticmethod
     def fromWebMessageInfoProto(webMessageInfoProto, isRead=True):
@@ -207,7 +207,6 @@ class TextMessage(WhatsAppMessage):
         messageProto.conversation = self['conversation']
         return messageProto
 
-
 class MediaMessage(WhatsAppMessage):
 
     def populateFromMessage(self, message):
@@ -223,7 +222,10 @@ class MediaMessage(WhatsAppMessage):
     def toProtobufMessage(self):
         mediaType = mediaTypeFromMime(self['mimetype'])
 
-        if mediaType == "image":
+        if self["mimetype"] == "image/webp":
+            protoFactory = WAMessage_pb2.StickerMessage
+            messageProtoKey = "stickerMessage"
+        elif mediaType == "image":
             protoFactory = WAMessage_pb2.ImageMessage
             messageProtoKey = "imageMessage"
         elif mediaType == "document":
@@ -236,6 +238,14 @@ class MediaMessage(WhatsAppMessage):
             protoFactory = WAMessage_pb2.AudioMessage
             messageProtoKey = "audioMessage"
 
+        if self._attrs.get('quoted'):
+            self._attrs['contextInfo'] = {}
+            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
+            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
+            if isinstance(self._attrs['quoted'], MediaMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
+                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
         mediaProto = jsonToProtoMessage(self._attrs, protoFactory)
         messageProto = WAMessage_pb2.Message()
         getattr(messageProto, messageProtoKey).MergeFrom(mediaProto)
@@ -247,7 +257,25 @@ class StickerMessage(MediaMessage):
     pass
 
 class ExtendedTextMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message["extendedTextMessage"].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        if self._attrs.get('quoted'):
+            self._attrs['contextInfo'] = {}
+            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
+            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
+            if isinstance(self._attrs['quoted'], MediaMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
+                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ExtendedTextMessage)
+        getattr(messageProto, "extendedTextMessage").MergeFrom(msgProto)
+        return messageProto
 
 class TemplateMessage(WhatsAppMessage):
 

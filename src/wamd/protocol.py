@@ -77,7 +77,9 @@ from .proto import WAMessage_pb2
 from .messages import (
     WhatsAppMessage,
     TextMessage,
-    MediaMessage
+    MediaMessage,
+    ExtendedTextMessage,
+    StickerMessage
 )
 from .signalhelper import (
     processPreKeyBundle,
@@ -544,7 +546,13 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         if isinstance(message, TextMessage):
             d = self._processTextMessage(message)
 
+        elif isinstance(message, ExtendedTextMessage):
+            d = self._processExtendedTextMessage(message)
+
         elif isinstance(message, MediaMessage):
+            d = self._processMediaMessage(message)
+
+        elif isinstance(message, StickerMessage):
             d = self._processMediaMessage(message)
 
         else:
@@ -607,7 +615,12 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     def _processTextMessage(self, message):
         if not message['conversation']:
-             return fail(ValueError("conversation parameters required"))
+            return fail(ValueError("conversation parameters required"))
+        return self._makeMessageNode(message, "text")
+
+    def _processExtendedTextMessage(self, message):
+        if not message['text']:
+            return fail(ValueError("text parameters required"))
         return self._makeMessageNode(message, "text")
 
     @inlineCallbacks
@@ -650,7 +663,10 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
             mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
 
-            if mediaType == "image":
+            if mimeType == "image/webp":
+                yield maybeDeferred(self._addStickerInfo, message, fileContent, mediaData)
+
+            elif mediaType == "image":
                 yield maybeDeferred(self._addImageInfo, message, fileContent, mediaData)
 
             elif mediaType == "document":
@@ -769,6 +785,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         yield adapter.ready()
         duration = int(adapter.info['format']['duration'])
         mediaData['seconds'] = duration
+
+    def _addStickerInfo(self, message, stickerBytes, mediaData):
+        mediaData["isAnimated"] = message._attrs.get("isAnimated", False)
 
     def _usyncQuery(self, jids, context):
         if not jids:
