@@ -47,7 +47,7 @@ xargs rm -rf < install.txt
 ```
 
 Example:
-```shell
+```python
 import sys
 import json
 import pyqrcode
@@ -78,7 +78,7 @@ from twisted.logger import (
 
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
 from wamd.common import AuthState
-from wamd.messages import TextMessage
+from wamd.messages import TextMessage, ExtendedTextMessage
 
 
 globalLogPublisher.addObserver(
@@ -143,6 +143,13 @@ def handleInbox(connection, message):
             to=message['from'],
             conversation="What's up?"
         )
+
+        # send message with quoted
+        #message = ExtendedTextMessage(
+        #    to=message["from"],
+        #    text="Whats's up?",
+        #    quoted=message
+        #)
 
         try:
             result = yield connection.relayMessage(message)
