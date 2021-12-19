@@ -1,5 +1,7 @@
 from zope.interface import implementer
 from urllib.parse import urlparse, urlencode, quote
+from base64 import b64decode
+from typing import Union
 
 from twisted.internet import reactor
 from twisted.internet.defer import maybeDeferred, Deferred, inlineCallbacks, succeed
@@ -9,9 +11,9 @@ from twisted.web.http_headers import Headers
 
 from ._tls import getTlsConnectionFactory
 from .errors import HttpRequestError
-from .utils import decryptMedia
+from .utils import decryptMedia, mediaTypeFromMime
 from .constants import Constants
-
+from .messages import MediaMessage
 
 @implementer(IPolicyForHTTPS)
 class WebClientContextFactory:
@@ -195,3 +197,17 @@ def downloadMediaAndDecrypt(directPath, mediaKey, mediaType):
     result = yield request(mediaUrl, headers=headers)
 
     return decryptMedia(result, mediaKey, mediaType)
+
+@inlineCallbacks
+def downloadMedia(message: Union[MediaMessage]) -> bytes:
+    if isinstance(message, MediaMessage):
+        fileContent = yield request(message['url'], headers={
+            'Origin': Constants.DEFAULT_ORIGIN,
+            'Referer': Constants.DEFAULT_ORIGIN,
+            'User-Agent': Constants.DEFAULT_USER_AGENT
+        })
+        return decryptMedia(
+            fileContent,
+            b64decode(message['mediaKey'].encode()),
+            mediaTypeFromMime(message['mimetype']))
+    raise TypeError('Unsupported Message Type')
