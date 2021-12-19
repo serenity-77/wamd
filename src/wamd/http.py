@@ -1,7 +1,9 @@
 from zope.interface import implementer
 from urllib.parse import urlparse, urlencode, quote
 from base64 import b64decode
-from typing import Union
+from typing import Optional, Union
+from tempfile import NamedTemporaryFile
+from filetype import guess_extension
 
 from twisted.internet import reactor
 from twisted.internet.defer import maybeDeferred, Deferred, inlineCallbacks, succeed
@@ -211,3 +213,12 @@ def downloadMedia(message: Union[MediaMessage]) -> bytes:
             b64decode(message['mediaKey'].encode()),
             mediaTypeFromMime(message['mimetype']))
     raise TypeError('Unsupported Message Type')
+
+@inlineCallbacks
+def downloadAndSave(message: Union[MediaMessage], filename: Optional[str] = None) -> str:
+    fileContent = yield downloadMedia(message)
+    extension = '.' + ((message['fileName'].split('.')[-1] if '.' in message['fileName'] else '') if mediaTypeFromMime(message['mimetype']) == 'document' else (guess_extension(fileContent) or ''))
+    fobject = open(filename + extension, 'wb') if filename else NamedTemporaryFile(mode='wb', delete=False, suffix=extension)
+    fobject.write(fileContent)
+    fobject.close()
+    return filename + extension if filename else fobject.name
