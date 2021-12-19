@@ -2,6 +2,7 @@ import time
 import base64
 import os
 import json
+import requests
 
 from io import BytesIO
 
@@ -625,7 +626,11 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     @inlineCallbacks
     def _processMediaMessage(self, message):
-        if message['url'].startswith("http:") or message['url'].startswith("https:"):
+        if isinstance(message['url'], bytes):
+            fileContent = message['url']
+        elif isinstance(message['url'], BytesIO):
+            fileContent = message['url'].getvalue()
+        elif message['url'].startswith("http:") or message['url'].startswith("https:"):
             self.log.debug("Downloading file from {url}", url=message['url'])
             try:
                 fileContent = yield doHttpRequest(message['url'])
@@ -658,7 +663,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
             mediaData['mimetype'] = mimeType
             mediaData['fileSha256'] = base64.b64encode(fileSha256).decode()
-            mediaData['fileLength'] = len(fileContent)
+            mediaData['fileLength'] = len(fileContent) if not message._attrs.get("fileLength") else message._attrs.get("fileLength")
             mediaData['mediaKey'] = base64.b64encode(encryptResult['mediaKey']).decode()
             mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
             mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
@@ -689,11 +694,13 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             yield maybeDeferred(
                 cachedMediaStore.saveCachedMedia,
                 fileSha256,
-                {'mediaType': mediaType, 'mediaData': mediaData})
+               {'mediaType': mediaType, 'mediaData': mediaData})
         else:
             self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
             mediaType = savedMedia['mediaType']
             mediaData = savedMedia['mediaData']
+            if message._attrs.get("fileLength"):
+                mediaData['fileLength'] = message._attrs.get("fileLength")
 
         message['mediaType'] = mediaType
 
@@ -740,12 +747,19 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         mediaData['url'] = uploadResultDict['url']
         mediaData['directPath'] = uploadResultDict['direct_path']
 
+    def _opts(self, message, type, **kwargs):
+        if type == "thumbnail":
+            out = message.get("thumbnail")
+            if isinstance(out, bytes):
+                return out.decode()
+            else:
+                return out
 
     def _addImageInfo(self, message, imageBytes, mediaData):
         height, width, thumbnail = processImage(imageBytes, mediaData['mimetype'])
         mediaData['height'] = height
         mediaData['width'] = width
-        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode()
+        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail", jpegThumbnail=base64.b64encode(thumbnail).decode())
 
     def _addDocumentInfo(self, message, documentBytes, mediaData):
         pathSplit = os.path.splitext(message['url'])
@@ -773,9 +787,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         yield adapter.saveFrame(frameIO, int(duration // 2))
         _, _, jpegThumbnail = processImage(frameIO.getvalue(), "image/jpeg")
         frameIO.close()
-        mediaData['seconds'] = duration
-        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode()
-
+        mediaData['seconds'] = duration if not message._attrs.get("duration") else message._attrs.get("duration")
+        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail", jpegThumbnail=base64.b64encode(jpegThumbnail).decode())
+ 
     @inlineCallbacks
     def _addAudioInfo(self, message, audioBytes, mediaData):
         if mediaData['mimetype'] == "application/ogg":
@@ -783,8 +797,10 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             mediaData['ptt'] = True
         adapter = FFMPEGVideoAdapter.fromBytes(audioBytes)
         yield adapter.ready()
+        os.remove(adapter.info['format']['filename'])
         duration = int(adapter.info['format']['duration'])
-        mediaData['seconds'] = duration
+        mediaData['ptt'] = mediaData.get("ptt", False) if not message._attrs.get("ptt") else message._attrs.get("ptt")
+        mediaData['seconds'] = duration if not message._attrs.get("duration") else message._attrs.get("duration")
 
     def _addStickerInfo(self, message, stickerBytes, mediaData):
         mediaData["isAnimated"] = message._attrs.get("isAnimated", False)

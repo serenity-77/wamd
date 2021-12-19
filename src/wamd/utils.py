@@ -6,7 +6,7 @@ import magic
 import time
 import random
 import math
-
+import tempfile
 
 from twisted.python import procutils
 from twisted.internet.defer import Deferred, maybeDeferred, succeed
@@ -317,7 +317,7 @@ class FFMPEGVideoAdapter:
 
     @classmethod
     def fromBytes(cls, data, reactor=None):
-        path = os.path.join("/tmp/", binascii.hexlify(os.urandom(16)).decode())
+        path = os.path.join(tempfile.gettempdir(), binascii.hexlify(os.urandom(16)).decode())
 
         with open(path, "wb") as fileIO:
             fileIO.write(data)
@@ -351,7 +351,7 @@ class FFMPEGVideoAdapter:
             binascii.hexlify(os.urandom(16)).decode(),
             format)
 
-        outputPath = os.path.join("/tmp/", outputFilename)
+        outputPath = os.path.join(tempfile.gettempdir(), outputFilename)
 
         duration = str(math.floor(duration))
 
