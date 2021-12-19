@@ -293,7 +293,16 @@ class ButtonsMessage(WhatsAppMessage):
 
 
 class ContactMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['templateMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactMessage)
+        getattr(messageProto, 'contactMessage').MergeFrom(msgProto)
+        return messageProto
 
 class ContactsArrayMessage(WhatsAppMessage):
     pass

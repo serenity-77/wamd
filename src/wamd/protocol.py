@@ -76,6 +76,7 @@ from .handlers import createNodeHandler
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import (
+    ContactMessage,
     WhatsAppMessage,
     TextMessage,
     MediaMessage,
@@ -556,6 +557,8 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         elif isinstance(message, StickerMessage):
             d = self._processMediaMessage(message)
 
+        elif isinstance(message, ContactMessage):
+            d = self._processContactMessage(message)
         else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
@@ -709,6 +712,10 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         return (yield self._makeMessageNode(message, "media", mediaType))
 
+    def _processContactMessage(self, message):
+        if message['vcard']:
+            return self._makeMessageNode(message, "text")
+        return fail(ValueError('vcard parameters required'))
 
     @inlineCallbacks
     def _addUploadInfo(self, uploadToken, body, mediaData):
