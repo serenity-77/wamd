@@ -300,6 +300,14 @@ class ContactMessage(WhatsAppMessage):
 
     def toProtobufMessage(self):
         messageProto = WAMessage_pb2.Message()
+        if self._attrs.get('quoted'):
+            self._attrs['contextInfo'] = self._attrs.get("contextInfo", {})
+            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
+            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
+            if isinstance(self._attrs['quoted'], MediaMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
+                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
         msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactMessage)
         getattr(messageProto, 'contactMessage').MergeFrom(msgProto)
         return messageProto
