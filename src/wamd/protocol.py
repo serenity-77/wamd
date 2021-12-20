@@ -2,7 +2,6 @@ import time
 import base64
 import os
 import json
-import requests
 
 from io import BytesIO
 
@@ -77,11 +76,15 @@ from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import (
     ContactMessage,
+    ContactsArrayMessage,
     WhatsAppMessage,
     TextMessage,
     MediaMessage,
     ExtendedTextMessage,
-    StickerMessage
+    StickerMessage,
+    LocationMessage,
+    LiveLocationMessage,
+    ListMessage
 )
 from .signalhelper import (
     processPreKeyBundle,
@@ -559,6 +562,16 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         elif isinstance(message, ContactMessage):
             d = self._processContactMessage(message)
+
+        elif isinstance(message, (LocationMessage, LiveLocationMessage)):
+            d = self._processLocationMessage(message)
+
+        elif isinstance(message, ListMessage):
+            d = self._processListMessage(message)
+
+        elif isinstance(message, ContactsArrayMessage):
+            d = self._processContactsArrayMessage(message)
+
         else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
@@ -625,7 +638,20 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
     def _processExtendedTextMessage(self, message):
         if not message['text']:
             return fail(ValueError("text parameters required"))
+        message["jpegThumbnail"] = None if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
         return self._makeMessageNode(message, "text")
+
+    def _processLocationMessage(self, message):
+        if (not message["degreesLatitude"]) and (not message["degreesLongitude"]):
+            return fail(ValueError("degreesLatitude and degreesLongitude parameters required"))
+        message["jpegThumbnail"] = None if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
+        return self._makeMessageNode(message, "media", "location" if isinstance(message, LocationMessage) else "livelocation")
+
+    def _processListMessage(self, message):
+        if (not message["sections"]) and (not message["buttonText"]) and (not message["description"]):
+            return fail(ValueError("description, buttonText, and sections parameters required"))
+        message["listType"] = 1 if not message["listType"] else message["listType"]
+        return self._makeMessageNode(message, "media", "list")
 
     @inlineCallbacks
     def _processMediaMessage(self, message):
@@ -697,7 +723,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             yield maybeDeferred(
                 cachedMediaStore.saveCachedMedia,
                 fileSha256,
-               {'mediaType': mediaType, 'mediaData': mediaData})
+                {'mediaType': mediaType, 'mediaData': mediaData})
         else:
             self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
             mediaType = savedMedia['mediaType']
@@ -717,6 +743,10 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             return self._makeMessageNode(message, "text")
         return fail(ValueError('vcard parameters required'))
 
+    def _processContactsArrayMessage(self, message):
+        if not message['contacts']:
+            return fail(ValueError('contacts parameters required'))
+        return self._makeMessageNode(message, "text")
     @inlineCallbacks
     def _addUploadInfo(self, uploadToken, body, mediaData):
         mediaConnInfo = yield self.request(Node(
@@ -754,7 +784,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         mediaData['url'] = uploadResultDict['url']
         mediaData['directPath'] = uploadResultDict['direct_path']
 
-    def _opts(self, message, type, **kwargs):
+    def _opts(self, message, type):
         if type == "thumbnail":
             out = message.get("thumbnail")
             if isinstance(out, bytes):
@@ -766,7 +796,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         height, width, thumbnail = processImage(imageBytes, mediaData['mimetype'])
         mediaData['height'] = height
         mediaData['width'] = width
-        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail", jpegThumbnail=base64.b64encode(thumbnail).decode())
+        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
 
     def _addDocumentInfo(self, message, documentBytes, mediaData):
         pathSplit = os.path.splitext(message['url'])
@@ -795,7 +825,7 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         _, _, jpegThumbnail = processImage(frameIO.getvalue(), "image/jpeg")
         frameIO.close()
         mediaData['seconds'] = duration if not message._attrs.get("duration") else message._attrs.get("duration")
-        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail", jpegThumbnail=base64.b64encode(jpegThumbnail).decode())
+        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
  
     @inlineCallbacks
     def _addAudioInfo(self, message, audioBytes, mediaData):

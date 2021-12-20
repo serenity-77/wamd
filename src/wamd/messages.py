@@ -67,6 +67,20 @@ class WhatsAppMessage:
     def populateFromMessage(self, message):
         pass
 
+    @property
+    def generateQuotedMessage(self):
+        if isinstance(self._attrs.get("quoted"), (TextMessage, ExtendedTextMessage, ContactMessage, MediaMessage, StickerMessage, LocationMessage)):
+            self._attrs["contextInfo"] = self._attrs.get("contextInfo", {})
+            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
+            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
+            if isinstance(self._attrs['quoted'], MediaMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs["quoted"]._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], LocationMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(LocationMessage(**self._attrs["quoted"]._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
+                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get("text")}
+
+
     _STR_INDENT = "    "
     _TEXT_LIMIT = 50
 
@@ -238,14 +252,8 @@ class MediaMessage(WhatsAppMessage):
             protoFactory = WAMessage_pb2.AudioMessage
             messageProtoKey = "audioMessage"
 
-        if self._attrs.get('quoted'):
-            self._attrs['contextInfo'] = self._attrs.get("contextInfo", {})
-            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
-            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
-            if isinstance(self._attrs['quoted'], MediaMessage):
-                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
-            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
-                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
         mediaProto = jsonToProtoMessage(self._attrs, protoFactory)
         messageProto = WAMessage_pb2.Message()
         getattr(messageProto, messageProtoKey).MergeFrom(mediaProto)
@@ -264,14 +272,7 @@ class ExtendedTextMessage(WhatsAppMessage):
 
     def toProtobufMessage(self):
         messageProto = WAMessage_pb2.Message()
-        if self._attrs.get('quoted'):
-            self._attrs['contextInfo'] = self._attrs.get("contextInfo", {})
-            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
-            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
-            if isinstance(self._attrs['quoted'], MediaMessage):
-                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
-            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
-                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
+        self._attrs.get("quoted") and self.generateQuotedMessage
 
         msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ExtendedTextMessage)
         getattr(messageProto, "extendedTextMessage").MergeFrom(msgProto)
@@ -300,28 +301,68 @@ class ContactMessage(WhatsAppMessage):
 
     def toProtobufMessage(self):
         messageProto = WAMessage_pb2.Message()
-        if self._attrs.get('quoted'):
-            self._attrs['contextInfo'] = self._attrs.get("contextInfo", {})
-            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
-            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
-            if isinstance(self._attrs['quoted'], MediaMessage):
-                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs['quoted']._attrs).toProtobufMessage())
-            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
-                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get('text')}
+        self._attrs.get("quoted") and self.generateQuotedMessage
         msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactMessage)
         getattr(messageProto, 'contactMessage').MergeFrom(msgProto)
         return messageProto
 
 class ContactsArrayMessage(WhatsAppMessage):
-    pass
 
+    def populateFromMessage(self, message):
+        for k, v in message['contactsArrayMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactsArrayMessage)
+        getattr(messageProto, 'contactsArrayMessage').MergeFrom(msgProto)
+        return messageProto
 class LiveLocationMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['liveLocationMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.LiveLocationMessage)
+        getattr(messageProto, "liveLocationMessage").MergeFrom(msgProto)
+        return messageProto
 
 
 class LocationMessage(WhatsAppMessage):
-    pass
 
+    def populateFromMessage(self, message):
+        for k, v in message['locationMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.LocationMessage)
+        getattr(messageProto, "locationMessage").MergeFrom(msgProto)
+        return messageProto
+
+class ListMessage(WhatsAppMessage):
+
+    def populateFromMessage(self, message):
+        for k, v in message['listMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ListMessage)
+        getattr(messageProto, "listMessage").MergeFrom(msgProto)
+        return messageProto
+
+class ListResponseMessage(WhatsAppMessage):
+    pass
 
 class ProtocolMessage(WhatsAppMessage):
     pass
@@ -341,7 +382,9 @@ _MESSAGE_TYPE_CLASS_MAPS = {
     'templateMessage': TemplateMessage,
     'stickerMessage': StickerMessage,
     'buttonsMessage': ButtonsMessage,
-    'templateButtonReplyMessage': TemplateButtonReplyMessage
+    'templateButtonReplyMessage': TemplateButtonReplyMessage,
+    'listMessage': ListMessage,
+    'listResponseMessage': ListResponseMessage
 }
 
 _MEDIA_KEYS_MESSAGE = [
