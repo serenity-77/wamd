@@ -295,7 +295,7 @@ class ButtonsMessage(WhatsAppMessage):
 class ContactMessage(WhatsAppMessage):
 
     def populateFromMessage(self, message):
-        for k, v in message['templateMessage'].items():
+        for k, v in message['contactMessage'].items():
             self[k] = v
 
     def toProtobufMessage(self):
