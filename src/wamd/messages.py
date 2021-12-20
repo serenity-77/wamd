@@ -294,11 +294,30 @@ class ButtonsMessage(WhatsAppMessage):
 
 
 class ContactMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['contactMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactMessage)
+        getattr(messageProto, 'contactMessage').MergeFrom(msgProto)
+        return messageProto
 
 class ContactsArrayMessage(WhatsAppMessage):
-    pass
 
+    def populateFromMessage(self, message):
+        for k, v in message['contactsArrayMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactsArrayMessage)
+        getattr(messageProto, 'contactsArrayMessage').MergeFrom(msgProto)
+        return messageProto
 class LiveLocationMessage(WhatsAppMessage):
 
     def populateFromMessage(self, message):
