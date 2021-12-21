@@ -9,3 +9,4 @@ protobuf
 python-magic
 pillow
 setuptools-rust
+git+https://github.com/h2non/filetype.py

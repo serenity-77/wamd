@@ -4,6 +4,7 @@ import os
 import json
 
 from io import BytesIO
+from typing import Text
 
 from twisted.internet.defer import (
     inlineCallbacks,
@@ -53,6 +54,7 @@ from .coder import WABinaryReader, WABinaryWriter, Node
 from .utils import (
     encodeUint,
     decodeUint,
+    protoMessageToJson,
     splitJid,
     buildJid,
     isJidSameUser,
@@ -77,6 +79,7 @@ from .proto import WAMessage_pb2
 from .messages import (
     ContactMessage,
     ContactsArrayMessage,
+    ProductMessage,
     WhatsAppMessage,
     TextMessage,
     MediaMessage,
@@ -573,6 +576,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         elif isinstance(message, ContactsArrayMessage):
             d = self._processContactsArrayMessage(message)
 
+        elif isinstance(message, ProductMessage):
+            d = self._processProductMessage(message)
+
         elif isinstance(message, ButtonsMessage):
             d = self._processButtonsMessage(message)
 
@@ -657,15 +663,44 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         message["listType"] = message._attrs.get("listType", 1)
         return self._makeMessageNode(message, "media", "list")
 
+    @inlineCallbacks
     def _processButtonsMessage(self, message):
         if not message["buttons"]:
             return fail(ValueError("buttons parameters required"))
-        message["headerType"] = message._attrs.get("headerType", "EMPTY")
-        message["buttons"] = [{"buttonId": x.get("id"), "buttonText": {"displayText": x.get("text")}, "type": "RESPONSE"} for x in message["buttons"]]
-        return self._makeMessageNode(message, "text")
+        message["buttons"] = [{"buttonId": x['id'], "buttonText": {"displayText": x['text']}, "type": x.get('type', 1)} for x in message["buttons"]]
+        headerType = isinstance(message['header'], (ExtendedTextMessage, TextMessage)) and 2
+        if headerType == 2:
+            message['text'] = message['header']['conversation'] or message['header']['text']
+        elif isinstance(message['header'], LocationMessage):
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+            headerType = 6
+        elif isinstance(message['header'], MediaMessage):
+            yield from self.generateMediaData(message['header'])
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+                headerType = mediaTypeFromMime(message[k]['mimetype']).upper()
+        else:
+            headerType = 1
+        message['headerType'] = headerType
+        return (yield self._makeMessageNode(message, "text"))
 
     @inlineCallbacks
-    def _processMediaMessage(self, message):
+    def _processProductMessage(self, message):
+        if not (message['businessOwnerJid'] and message['product'] and message['catalog']):
+            return fail(ValueError('businessOwnerJid, product, and catalog parameter required'))
+        if not isinstance(message['product']['productImage'], MediaMessage) and isinstance(message['catalog']['catalogImage'], MediaMessage):
+            return fail(TypeError("imageMessage object is not MediaMessage object"))
+        yield from self.generateMediaData(message['product']['productImage'])
+        yield from self.generateMediaData(message['catalog']['catalogImage'])
+        message['product']['productImage'] = message['product']['productImage']._attrs
+        message['catalog']['catalogImage'] = message['catalog']['catalogImage']._attrs
+        return (yield self._makeMessageNode(message, "media", "product"))
+
+
+    def generateMediaData(self, message):
         if isinstance(message['url'], bytes):
             fileContent = message['url']
         elif isinstance(message['url'], BytesIO):
@@ -746,8 +781,12 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
         for k, v in mediaData.items():
             message[k] = v
+        return message
 
-        return (yield self._makeMessageNode(message, "media", mediaType))
+    @inlineCallbacks
+    def _processMediaMessage(self, message):
+        yield from self.generateMediaData(message)
+        return (yield self._makeMessageNode(message, "media", message["mediaType"]))
 
     def _processContactMessage(self, message):
         if message['vcard']:
