@@ -4,6 +4,7 @@ import os
 import json
 
 from io import BytesIO
+from typing import Text
 
 from twisted.internet.defer import (
     inlineCallbacks,
@@ -53,6 +54,7 @@ from .coder import WABinaryReader, WABinaryWriter, Node
 from .utils import (
     encodeUint,
     decodeUint,
+    protoMessageToJson,
     splitJid,
     buildJid,
     isJidSameUser,
@@ -85,7 +87,8 @@ from .messages import (
     StickerMessage,
     LocationMessage,
     LiveLocationMessage,
-    ListMessage
+    ListMessage,
+    ButtonsMessage
 )
 from .signalhelper import (
     processPreKeyBundle,
@@ -576,6 +579,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         elif isinstance(message, ProductMessage):
             d = self._processProductMessage(message)
 
+        elif isinstance(message, ButtonsMessage):
+            d = self._processButtonsMessage(message)
+
         else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
@@ -652,38 +658,49 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         return self._makeMessageNode(message, "media", "location" if isinstance(message, LocationMessage) else "livelocation")
 
     def _processListMessage(self, message):
-        if (not message["sections"]) and (not message["buttonText"]) and (not message["description"]):
-            return fail(ValueError("description, buttonText, and sections parameters required"))
-        message["listType"] = 1 if not message["listType"] else message["listType"]
+        if (not message["sections"]) and (not message["buttonText"]):
+            return fail(ValueError("buttonText and sections parameters required"))
+        message["listType"] = message._attrs.get("listType", 1)
         return self._makeMessageNode(message, "media", "list")
 
     @inlineCallbacks
+    def _processButtonsMessage(self, message):
+        if not message["buttons"]:
+            return fail(ValueError("buttons parameters required"))
+        message["buttons"] = [{"buttonId": x['id'], "buttonText": {"displayText": x['text']}, "type": x.get('type', 1)} for x in message["buttons"]]
+        headerType = isinstance(message['header'], (ExtendedTextMessage, TextMessage)) and 2
+        if headerType == 2:
+            message['text'] = message['header']['conversation'] or message['header']['text']
+        elif isinstance(message['header'], LocationMessage):
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+            headerType = 6
+        elif isinstance(message['header'], MediaMessage):
+            yield from self.generateMediaData(message['header'])
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+                headerType = mediaTypeFromMime(message[k]['mimetype']).upper()
+        else:
+            headerType = 1
+        message['headerType'] = headerType
+        return (yield self._makeMessageNode(message, "text"))
+
+    @inlineCallbacks
     def _processProductMessage(self, message):
-        """
-            optional ImageMessage productImage = 1;
-            optional string productId = 2;
-            optional string title = 3;
-            optional string description = 4;
-            optional string currencyCode = 5;
-            optional int64 priceAmount1000 = 6;
-            optional string retailerId = 7;
-            optional string url = 8;
-            optional uint32 productImageCount = 9;
-            optional string firstImageId = 11;
-            optional int64 salePriceAmount1000 = 12;
-        """
         if not (message['businessOwnerJid'] and message['product'] and message['catalog']):
             return fail(ValueError('businessOwnerJid, product, and catalog parameter required'))
         if not isinstance(message['product']['productImage'], MediaMessage) and isinstance(message['catalog']['catalogImage'], MediaMessage):
             return fail(TypeError("imageMessage object is not MediaMessage object"))
-        yield from self.GenerateMediaData(message['product']['productImage'])
-        yield from self.GenerateMediaData(message['catalog']['catalogImage'])
+        yield from self.generateMediaData(message['product']['productImage'])
+        yield from self.generateMediaData(message['catalog']['catalogImage'])
         message['product']['productImage'] = message['product']['productImage']._attrs
         message['catalog']['catalogImage'] = message['catalog']['catalogImage']._attrs
         return (yield self._makeMessageNode(message, "media", "product"))
 
 
-    def GenerateMediaData(self, message):
+    def generateMediaData(self, message):
         if isinstance(message['url'], bytes):
             fileContent = message['url']
         elif isinstance(message['url'], BytesIO):
@@ -768,88 +785,8 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     @inlineCallbacks
     def _processMediaMessage(self, message):
-        if isinstance(message['url'], bytes):
-            fileContent = message['url']
-        elif isinstance(message['url'], BytesIO):
-            fileContent = message['url'].getvalue()
-        elif message['url'].startswith("http:") or message['url'].startswith("https:"):
-            self.log.debug("Downloading file from {url}", url=message['url'])
-            try:
-                fileContent = yield doHttpRequest(message['url'])
-            except:
-                raise WAMDError("Failed to download media from %s\n%s" % (message['url'], Failure()))
-        else:
-            if not os.path.exists(message['url']):
-                raise FileNotFoundError("File %s not found" % (message['url']))
-
-            fileIO = open(message['url'], "rb")
-            fileContent = fileIO.read()
-            fileIO.close()
-
-        fileSha256 = sha256Hash(fileContent)
-
-        cachedMediaStore = ICachedMediaStore(self.authState)
-        savedMedia = yield maybeDeferred(cachedMediaStore.getCachedMedia, fileSha256)
-
-        if savedMedia is None:
-            mediaData = {}
-
-            if message['mimetype'] is not None:
-                mimeType = message['mimetype']
-            else:
-                mimeType = mimeTypeFromBuffer(fileContent)
-
-            mediaType = mediaTypeFromMime(mimeType)
-
-            encryptResult = encryptMedia(fileContent, mediaType)
-
-            mediaData['mimetype'] = mimeType
-            mediaData['fileSha256'] = base64.b64encode(fileSha256).decode()
-            mediaData['fileLength'] = len(fileContent) if not message._attrs.get("fileLength") else message._attrs.get("fileLength")
-            mediaData['mediaKey'] = base64.b64encode(encryptResult['mediaKey']).decode()
-            mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
-            mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
-
-            if mimeType == "image/webp":
-                yield maybeDeferred(self._addStickerInfo, message, fileContent, mediaData)
-
-            elif mediaType == "image":
-                yield maybeDeferred(self._addImageInfo, message, fileContent, mediaData)
-
-            elif mediaType == "document":
-                yield maybeDeferred(self._addDocumentInfo, message, fileContent, mediaData)
-
-            elif mediaType == "video":
-                yield maybeDeferred(self._addVideoInfo, message, fileContent, mediaData)
-
-            elif mediaType == "audio":
-                yield maybeDeferred(self._addAudioInfo, message, fileContent, mediaData)
-
-            uploadToken = base64.urlsafe_b64encode(encryptResult['fileEncSha256']).decode()
-
-            # Upload media
-            yield self._addUploadInfo(
-                uploadToken,
-                encryptResult['enc'] + encryptResult['mac'],
-                mediaData)
-
-            yield maybeDeferred(
-                cachedMediaStore.saveCachedMedia,
-                fileSha256,
-                {'mediaType': mediaType, 'mediaData': mediaData})
-        else:
-            self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
-            mediaType = savedMedia['mediaType']
-            mediaData = savedMedia['mediaData']
-            if message._attrs.get("fileLength"):
-                mediaData['fileLength'] = message._attrs.get("fileLength")
-
-        message['mediaType'] = mediaType
-
-        for k, v in mediaData.items():
-            message[k] = v
-
-        return (yield self._makeMessageNode(message, "media", mediaType))
+        yield from self.generateMediaData(message)
+        return (yield self._makeMessageNode(message, "media", message["mediaType"]))
 
     def _processContactMessage(self, message):
         if message['vcard']:
