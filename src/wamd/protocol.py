@@ -77,6 +77,7 @@ from .proto import WAMessage_pb2
 from .messages import (
     ContactMessage,
     ContactsArrayMessage,
+    ProductMessage,
     WhatsAppMessage,
     TextMessage,
     MediaMessage,
@@ -572,6 +573,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         elif isinstance(message, ContactsArrayMessage):
             d = self._processContactsArrayMessage(message)
 
+        elif isinstance(message, ProductMessage):
+            d = self._processProductMessage(message)
+
         else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
@@ -652,6 +656,115 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             return fail(ValueError("description, buttonText, and sections parameters required"))
         message["listType"] = 1 if not message["listType"] else message["listType"]
         return self._makeMessageNode(message, "media", "list")
+
+    @inlineCallbacks
+    def _processProductMessage(self, message):
+        """
+            optional ImageMessage productImage = 1;
+            optional string productId = 2;
+            optional string title = 3;
+            optional string description = 4;
+            optional string currencyCode = 5;
+            optional int64 priceAmount1000 = 6;
+            optional string retailerId = 7;
+            optional string url = 8;
+            optional uint32 productImageCount = 9;
+            optional string firstImageId = 11;
+            optional int64 salePriceAmount1000 = 12;
+        """
+        if not (message['businessOwnerJid'] and message['product'] and message['catalog']):
+            return fail(ValueError('businessOwnerJid, product, and catalog parameter required'))
+        if not isinstance(message['product']['productImage'], MediaMessage) and isinstance(message['catalog']['catalogImage'], MediaMessage):
+            return fail(TypeError("imageMessage object is not MediaMessage object"))
+        yield from self.GenerateMediaData(message['product']['productImage'])
+        yield from self.GenerateMediaData(message['catalog']['catalogImage'])
+        message['product']['productImage'] = message['product']['productImage']._attrs
+        message['catalog']['catalogImage'] = message['catalog']['catalogImage']._attrs
+        return (yield self._makeMessageNode(message, "media", "product"))
+
+
+    def GenerateMediaData(self, message):
+        if isinstance(message['url'], bytes):
+            fileContent = message['url']
+        elif isinstance(message['url'], BytesIO):
+            fileContent = message['url'].getvalue()
+        elif message['url'].startswith("http:") or message['url'].startswith("https:"):
+            self.log.debug("Downloading file from {url}", url=message['url'])
+            try:
+                fileContent = yield doHttpRequest(message['url'])
+            except:
+                raise WAMDError("Failed to download media from %s\n%s" % (message['url'], Failure()))
+        else:
+            if not os.path.exists(message['url']):
+                raise FileNotFoundError("File %s not found" % (message['url']))
+
+            fileIO = open(message['url'], "rb")
+            fileContent = fileIO.read()
+            fileIO.close()
+
+        fileSha256 = sha256Hash(fileContent)
+
+        cachedMediaStore = ICachedMediaStore(self.authState)
+        savedMedia = yield maybeDeferred(cachedMediaStore.getCachedMedia, fileSha256)
+
+        if savedMedia is None:
+            mediaData = {}
+
+            if message['mimetype'] is not None:
+                mimeType = message['mimetype']
+            else:
+                mimeType = mimeTypeFromBuffer(fileContent)
+
+            mediaType = mediaTypeFromMime(mimeType)
+
+            encryptResult = encryptMedia(fileContent, mediaType)
+
+            mediaData['mimetype'] = mimeType
+            mediaData['fileSha256'] = base64.b64encode(fileSha256).decode()
+            mediaData['fileLength'] = len(fileContent) if not message._attrs.get("fileLength") else message._attrs.get("fileLength")
+            mediaData['mediaKey'] = base64.b64encode(encryptResult['mediaKey']).decode()
+            mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
+            mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
+
+            if mimeType == "image/webp":
+                yield maybeDeferred(self._addStickerInfo, message, fileContent, mediaData)
+
+            elif mediaType == "image":
+                yield maybeDeferred(self._addImageInfo, message, fileContent, mediaData)
+
+            elif mediaType == "document":
+                yield maybeDeferred(self._addDocumentInfo, message, fileContent, mediaData)
+
+            elif mediaType == "video":
+                yield maybeDeferred(self._addVideoInfo, message, fileContent, mediaData)
+
+            elif mediaType == "audio":
+                yield maybeDeferred(self._addAudioInfo, message, fileContent, mediaData)
+
+            uploadToken = base64.urlsafe_b64encode(encryptResult['fileEncSha256']).decode()
+
+            # Upload media
+            yield self._addUploadInfo(
+                uploadToken,
+                encryptResult['enc'] + encryptResult['mac'],
+                mediaData)
+
+            yield maybeDeferred(
+                cachedMediaStore.saveCachedMedia,
+                fileSha256,
+                {'mediaType': mediaType, 'mediaData': mediaData})
+        else:
+            self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
+            mediaType = savedMedia['mediaType']
+            mediaData = savedMedia['mediaData']
+            if message._attrs.get("fileLength"):
+                mediaData['fileLength'] = message._attrs.get("fileLength")
+
+        message['mediaType'] = mediaType
+
+        for k, v in mediaData.items():
+            message[k] = v
+        return message
 
     @inlineCallbacks
     def _processMediaMessage(self, message):

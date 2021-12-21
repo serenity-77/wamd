@@ -288,6 +288,17 @@ class TemplateMessage(WhatsAppMessage):
 class TemplateButtonReplyMessage(WhatsAppMessage):
     pass
 
+class ProductMessage(WhatsAppMessage):
+    def populateFromMessage(self, message):
+        for k, v in message['productMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get('quoted') and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ProductMessage)
+        getattr(messageProto, "productMessage").MergeFrom(msgProto)
+        return messageProto
 
 class ButtonsMessage(WhatsAppMessage):
     pass
@@ -384,7 +395,8 @@ _MESSAGE_TYPE_CLASS_MAPS = {
     'buttonsMessage': ButtonsMessage,
     'templateButtonReplyMessage': TemplateButtonReplyMessage,
     'listMessage': ListMessage,
-    'listResponseMessage': ListResponseMessage
+    'listResponseMessage': ListResponseMessage,
+    'productMessage': ProductMessage
 }
 
 _MEDIA_KEYS_MESSAGE = [
