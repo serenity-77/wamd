@@ -84,7 +84,8 @@ from .messages import (
     StickerMessage,
     LocationMessage,
     LiveLocationMessage,
-    ListMessage
+    ListMessage,
+    ButtonsMessage
 )
 from .signalhelper import (
     processPreKeyBundle,
@@ -572,6 +573,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         elif isinstance(message, ContactsArrayMessage):
             d = self._processContactsArrayMessage(message)
 
+        elif isinstance(message, ButtonsMessage):
+            d = self._processButtonsMessage(message)
+
         else:
             return fail(
                 NotImplementedError("%s is not implemented" % qual(message.__class__))
@@ -648,10 +652,17 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         return self._makeMessageNode(message, "media", "location" if isinstance(message, LocationMessage) else "livelocation")
 
     def _processListMessage(self, message):
-        if (not message["sections"]) and (not message["buttonText"]) and (not message["description"]):
-            return fail(ValueError("description, buttonText, and sections parameters required"))
-        message["listType"] = 1 if not message["listType"] else message["listType"]
+        if (not message["sections"]) and (not message["buttonText"]):
+            return fail(ValueError("buttonText and sections parameters required"))
+        message["listType"] = message._attrs.get("listType", 1)
         return self._makeMessageNode(message, "media", "list")
+
+    def _processButtonsMessage(self, message):
+        if not message["buttons"]:
+            return fail(ValueError("buttons parameters required"))
+        message["headerType"] = message._attrs.get("headerType", "EMPTY")
+        message["buttons"] = [{"buttonId": x.get("id"), "buttonText": {"displayText": x.get("text")}, "type": "RESPONSE"} for x in message["buttons"]]
+        return self._makeMessageNode(message, "text")
 
     @inlineCallbacks
     def _processMediaMessage(self, message):
