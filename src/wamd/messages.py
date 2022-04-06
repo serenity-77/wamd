@@ -67,6 +67,21 @@ class WhatsAppMessage:
     def populateFromMessage(self, message):
         pass
 
+    @property
+    def generateQuotedMessage(self):
+        if isinstance(self._attrs.get("quoted"), (TextMessage, ExtendedTextMessage, ContactMessage, MediaMessage, StickerMessage, LocationMessage, LiveLocationMessage)):
+            self._attrs["contextInfo"] = self._attrs.get("contextInfo", {})
+            self._attrs["contextInfo"]["stanzaId"]= self._attrs["quoted"]._attrs["id"]
+            self._attrs["contextInfo"]["participant"]= self._attrs["quoted"]._attrs.get("participant", self._attrs["quoted"]._attrs["from"])
+            if isinstance(self._attrs['quoted'], MediaMessage):
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(MediaMessage(**self._attrs["quoted"]._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (LocationMessage, LiveLocationMessage)):
+                message = LocationMessage if isinstance(self._attrs["quoted"], LocationMessage) else LiveLocationMessage
+                self._attrs["contextInfo"]["quotedMessage"] = protoMessageToJson(message(**self._attrs["quoted"]._attrs).toProtobufMessage())
+            elif isinstance(self._attrs["quoted"], (TextMessage, ExtendedTextMessage)):
+                self._attrs["contextInfo"]["quotedMessage"] = {"conversation":self._attrs["quoted"]._attrs.get('conversation') or self._attrs["quoted"]._attrs.get("text")}
+
+
     _STR_INDENT = "    "
     _TEXT_LIMIT = 50
 
@@ -136,7 +151,7 @@ class WhatsAppMessage:
 
     @staticmethod
     def generateMessageId():
-        return "3EB0" + binascii.hexlify(os.urandom(8)).decode().upper()
+        return binascii.hexlify(os.urandom(23)).decode().upper()
 
     @staticmethod
     def fromWebMessageInfoProto(webMessageInfoProto, isRead=True):
@@ -207,7 +222,6 @@ class TextMessage(WhatsAppMessage):
         messageProto.conversation = self['conversation']
         return messageProto
 
-
 class MediaMessage(WhatsAppMessage):
 
     def populateFromMessage(self, message):
@@ -223,7 +237,10 @@ class MediaMessage(WhatsAppMessage):
     def toProtobufMessage(self):
         mediaType = mediaTypeFromMime(self['mimetype'])
 
-        if mediaType == "image":
+        if self["mimetype"] == "image/webp":
+            protoFactory = WAMessage_pb2.StickerMessage
+            messageProtoKey = "stickerMessage"
+        elif mediaType == "image":
             protoFactory = WAMessage_pb2.ImageMessage
             messageProtoKey = "imageMessage"
         elif mediaType == "document":
@@ -236,6 +253,8 @@ class MediaMessage(WhatsAppMessage):
             protoFactory = WAMessage_pb2.AudioMessage
             messageProtoKey = "audioMessage"
 
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
         mediaProto = jsonToProtoMessage(self._attrs, protoFactory)
         messageProto = WAMessage_pb2.Message()
         getattr(messageProto, messageProtoKey).MergeFrom(mediaProto)
@@ -247,7 +266,18 @@ class StickerMessage(MediaMessage):
     pass
 
 class ExtendedTextMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message["extendedTextMessage"].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ExtendedTextMessage)
+        getattr(messageProto, "extendedTextMessage").MergeFrom(msgProto)
+        return messageProto
 
 class TemplateMessage(WhatsAppMessage):
 
@@ -259,24 +289,105 @@ class TemplateMessage(WhatsAppMessage):
 class TemplateButtonReplyMessage(WhatsAppMessage):
     pass
 
+class ProductMessage(WhatsAppMessage):
+    def populateFromMessage(self, message):
+        for k, v in message['productMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get('quoted') and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ProductMessage)
+        getattr(messageProto, "productMessage").MergeFrom(msgProto)
+        return messageProto
+
+class ButtonsResponseMessage(WhatsAppMessage):
+    pass
 
 class ButtonsMessage(WhatsAppMessage):
-    pass
 
+    def populateFromMessage(self, message):
+        for k, v in message['buttonsMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ButtonsMessage)
+        getattr(messageProto, "buttonsMessage").MergeFrom(msgProto)
+        return messageProto
 
 class ContactMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['contactMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactMessage)
+        getattr(messageProto, 'contactMessage').MergeFrom(msgProto)
+        return messageProto
 
 class ContactsArrayMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['contactsArrayMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ContactsArrayMessage)
+        getattr(messageProto, 'contactsArrayMessage').MergeFrom(msgProto)
+        return messageProto
 
 class LiveLocationMessage(WhatsAppMessage):
-    pass
+
+    def populateFromMessage(self, message):
+        for k, v in message['liveLocationMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.LiveLocationMessage)
+        getattr(messageProto, "liveLocationMessage").MergeFrom(msgProto)
+        return messageProto
 
 
 class LocationMessage(WhatsAppMessage):
-    pass
 
+    def populateFromMessage(self, message):
+        for k, v in message['locationMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.LocationMessage)
+        getattr(messageProto, "locationMessage").MergeFrom(msgProto)
+        return messageProto
+
+class ListMessage(WhatsAppMessage):
+
+    def populateFromMessage(self, message):
+        for k, v in message['listMessage'].items():
+            self[k] = v
+
+    def toProtobufMessage(self):
+        messageProto = WAMessage_pb2.Message()
+        self._attrs.get("quoted") and self.generateQuotedMessage
+
+        msgProto = jsonToProtoMessage(self._attrs, WAMessage_pb2.ListMessage)
+        getattr(messageProto, "listMessage").MergeFrom(msgProto)
+        return messageProto
+
+class ListResponseMessage(WhatsAppMessage):
+    pass
 
 class ProtocolMessage(WhatsAppMessage):
     pass
@@ -296,7 +407,12 @@ _MESSAGE_TYPE_CLASS_MAPS = {
     'templateMessage': TemplateMessage,
     'stickerMessage': StickerMessage,
     'buttonsMessage': ButtonsMessage,
-    'templateButtonReplyMessage': TemplateButtonReplyMessage
+    'templateButtonReplyMessage': TemplateButtonReplyMessage,
+    'listMessage': ListMessage,
+    'listResponseMessage': ListResponseMessage,
+    'productMessage': ProductMessage,
+    'buttonsMessage': ButtonsMessage,
+    'buttonsResponseMessage': ButtonsResponseMessage
 }
 
 _MEDIA_KEYS_MESSAGE = [

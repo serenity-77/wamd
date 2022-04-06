@@ -4,6 +4,7 @@ import os
 import json
 
 from io import BytesIO
+from typing import Text
 
 from twisted.internet.defer import (
     inlineCallbacks,
@@ -37,7 +38,12 @@ from axolotl.ecc import curve, djbec
 from axolotl.util.keyhelper import KeyHelper
 from axolotl.state.prekeybundle import PreKeyBundle
 from axolotl.identitykey import IdentityKey
-
+from typing import (
+    List,
+    Optional,
+    Union,
+    Literal
+)
 
 from .constants import Constants
 from .common import AuthState
@@ -53,6 +59,7 @@ from .coder import WABinaryReader, WABinaryWriter, Node
 from .utils import (
     encodeUint,
     decodeUint,
+    protoMessageToJson,
     splitJid,
     buildJid,
     isJidSameUser,
@@ -75,9 +82,18 @@ from .handlers import createNodeHandler
 from ._tls import getTlsConnectionFactory
 from .proto import WAMessage_pb2
 from .messages import (
+    ContactMessage,
+    ContactsArrayMessage,
+    ProductMessage,
     WhatsAppMessage,
     TextMessage,
-    MediaMessage
+    MediaMessage,
+    ExtendedTextMessage,
+    StickerMessage,
+    LocationMessage,
+    LiveLocationMessage,
+    ListMessage,
+    ButtonsMessage
 )
 from .signalhelper import (
     processPreKeyBundle,
@@ -544,8 +560,32 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         if isinstance(message, TextMessage):
             d = self._processTextMessage(message)
 
+        elif isinstance(message, ExtendedTextMessage):
+            d = self._processExtendedTextMessage(message)
+
         elif isinstance(message, MediaMessage):
             d = self._processMediaMessage(message)
+
+        elif isinstance(message, StickerMessage):
+            d = self._processMediaMessage(message)
+
+        elif isinstance(message, ContactMessage):
+            d = self._processContactMessage(message)
+
+        elif isinstance(message, (LocationMessage, LiveLocationMessage)):
+            d = self._processLocationMessage(message)
+
+        elif isinstance(message, ListMessage):
+            d = self._processListMessage(message)
+
+        elif isinstance(message, ContactsArrayMessage):
+            d = self._processContactsArrayMessage(message)
+
+        elif isinstance(message, ProductMessage):
+            d = self._processProductMessage(message)
+
+        elif isinstance(message, ButtonsMessage):
+            d = self._processButtonsMessage(message)
 
         else:
             return fail(
@@ -605,14 +645,233 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
     # sendMessage used by WebSocketClientProtocol
     relayMessage = sendMsg
 
-    def _processTextMessage(self, message):
-        if not message['conversation']:
-             return fail(ValueError("conversation parameters required"))
-        return self._makeMessageNode(message, "text")
+    @inlineCallbacks
+    def groupMetadata(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'get',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            },Node('query', {'request': 'interactive'}))))
+
+    @inlineCallbacks 
+    def getProfilePic(self, jid: str):
+        node = Node(
+                'iq', {
+                    'to':jid,
+                    'id': self._generateMessageId(),
+                    'type':'get',
+                    'xmlns': 'w:profile:picture'
+                }, Node(
+                    'picture',
+                    {
+                        'type': 'image',
+                        'query': 'url'
+                    })
+            )
+        respNode = yield self.request(node)
+        return (yield doHttpRequest(respNode.children[0]['url']))
 
     @inlineCallbacks
-    def _processMediaMessage(self, message):
-        if message['url'].startswith("http:") or message['url'].startswith("https:"):
+    def groupLeave(self, jid: str):
+        node = Node(
+                'iq',{
+                    'type': 'set',
+                    'id':self._generateMessageId(),
+                    'xmlns': 'w:g2',
+                    'to': '@g.us'
+
+                },
+                Node('leave', {}, Node('group', {'id': jid}))
+            )
+        return (yield self.request(node))
+
+    @inlineCallbacks
+    def groupUpdateSubject(self, jid: str, subject: str):
+        node = Node(
+                'iq', {
+                    'type': 'set',
+                    'id': self._generateMessageId(),
+                    'xmlns': 'w:g2',
+                    'to': jid
+                    },Node('subject', {}, subject.encode())
+                )
+        return (yield self.request(node))
+
+    @inlineCallbacks
+    def groupAcceptInvite(self, icode: str):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to':'@g.us'
+            },Node(
+                'invite',
+                {'code': icode}
+            )
+        ))).children[0]['jid']
+
+    @inlineCallbacks
+    def groupParticipantsUpdate(self, jid: str, participants: List[str], action: str):
+        """
+        :param action: "add"|"remove"|"promote"|"demote"
+        """
+        return (yield self.request(Node('iq',{
+            'type':'set',
+            'id':self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            },[Node(action, {}, [Node('participant', {'jid': i})]) for i in participants])))
+
+    @inlineCallbacks
+    def groupSettingUpdate(self, jid: str, setting: str):
+        """
+        :param setting: "announcement" | "not_announcement" | "locked" | "unlocked"
+        """
+        return (yield self.request(Node('iq',{
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node(setting)])))
+
+    @inlineCallbacks
+    def groupRevokeInvite(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node('invite')]))).children[0]['code']
+
+    @inlineCallbacks
+    def groupInviteCode(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'get',
+            'id':self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to':jid
+            }, [Node('invite')]))).children[0]['code']
+
+    @inlineCallbacks
+    def groupUpdateDescription(self, jid: str, description:Optional[str] = None):
+        prev = (yield self.groupMetadata(jid)).children[0]['id']
+        return (yield self.request(Node(
+            'iq', {
+                'type':'set',
+                'id': self._generateMessageId(),
+                'xmlns': 'w:g2',
+                'to': jid
+                },
+            [Node('description', {
+                **({'id': self._generateMessageId()} if description else {'delete': True}), **({'prev': prev} if prev else {})},
+                Node('body', {}, description.encode() if description else None))]
+            )))
+
+    @inlineCallbacks
+    def groupEphemeral(self, jid: str, Expiration: int):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node(*['ephemeral' if Expiration else 'not_ephemeral', {'ephemeral': Expiration} if Expiration else {}])])))
+
+    @inlineCallbacks
+    def updateProfilePicture(self, jid: str, image: Union[str, bytes]):
+        if isinstance(image, str):
+            image = open(image, 'rb').read()
+        return (yield self.request(Node('iq',{
+            'type': 'set',
+            'to': jid,
+            'id': self._generateMessageId(),
+            'xmlns': 'w:profile:picture'
+        },[Node('picture', {'type': 'image'}, image)])))
+
+    @inlineCallbacks
+    def blockList(self):
+        return (yield self.request(Node('iq', {
+            'xmlns':'blocklist',
+            'id': self._generateMessageId(),
+            'to': Constants.S_WHATSAPP_NET,
+            'type': 'get'
+            })))
+
+    @inlineCallbacks
+    def updateBlockStatus(self, jid: str, action: Literal['unblock', 'block']):
+        return (yield self.request(Node('iq', {
+            'xmlns':'blocklist',
+            'id': self._generateMessageId(),
+            'to': Constants.S_WHATSAPP_NET,
+            'type': 'set'
+            },[Node('item', {'action': action, 'jid': jid})] )))
+
+    def _processTextMessage(self, message):
+        if not message['conversation']:
+            return fail(ValueError("conversation parameters required"))
+        return self._makeMessageNode(message, "text")
+
+    def _processExtendedTextMessage(self, message):
+        if not message['text']:
+            return fail(ValueError("text parameters required"))
+        message["jpegThumbnail"] = None if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
+        return self._makeMessageNode(message, "text")
+
+    def _processLocationMessage(self, message):
+        if (not message["degreesLatitude"]) and (not message["degreesLongitude"]):
+            return fail(ValueError("degreesLatitude and degreesLongitude parameters required"))
+        message["jpegThumbnail"] = None if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
+        return self._makeMessageNode(message, "media", "location" if isinstance(message, LocationMessage) else "livelocation")
+
+    def _processListMessage(self, message):
+        if (not message["sections"]) and (not message["buttonText"]):
+            return fail(ValueError("buttonText and sections parameters required"))
+        message["listType"] = message._attrs.get("listType", 1)
+        return self._makeMessageNode(message, "media", "list")
+
+    @inlineCallbacks
+    def _processButtonsMessage(self, message):
+        if not message["buttons"]:
+            return fail(ValueError("buttons parameters required"))
+        message["buttons"] = [{"buttonId": x['id'], "buttonText": {"displayText": x['text']}, "type": x.get('type', 1)} for x in message["buttons"]]
+        headerType = isinstance(message['header'], (ExtendedTextMessage, TextMessage)) and 2
+        if headerType == 2:
+            message['text'] = message['header']['conversation'] or message['header']['text']
+        elif isinstance(message['header'], LocationMessage):
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+            headerType = 6
+        elif isinstance(message['header'], MediaMessage):
+            yield from self.generateMediaData(message['header'])
+            mtype = protoMessageToJson(message['header'].toProtobufMessage())
+            for k in mtype.keys():
+                message[k] = message['header']._attrs
+                headerType = mediaTypeFromMime(message[k]['mimetype']).upper()
+        else:
+            headerType = 1
+        message['headerType'] = headerType
+        return (yield self._makeMessageNode(message, "text"))
+
+    @inlineCallbacks
+    def _processProductMessage(self, message):
+        if not (message['businessOwnerJid'] and message['product'] and message['catalog']):
+            return fail(ValueError('businessOwnerJid, product, and catalog parameter required'))
+        if not isinstance(message['product']['productImage'], MediaMessage) and isinstance(message['catalog']['catalogImage'], MediaMessage):
+            return fail(TypeError("imageMessage object is not MediaMessage object"))
+        yield from self.generateMediaData(message['product']['productImage'])
+        yield from self.generateMediaData(message['catalog']['catalogImage'])
+        message['product']['productImage'] = message['product']['productImage']._attrs
+        message['catalog']['catalogImage'] = message['catalog']['catalogImage']._attrs
+        return (yield self._makeMessageNode(message, "media", "product"))
+
+
+    def generateMediaData(self, message):
+        if isinstance(message['url'], bytes):
+            fileContent = message['url']
+        elif isinstance(message['url'], BytesIO):
+            fileContent = message['url'].getvalue()
+        elif message['url'].startswith("http:") or message['url'].startswith("https:"):
             self.log.debug("Downloading file from {url}", url=message['url'])
             try:
                 fileContent = yield doHttpRequest(message['url'])
@@ -645,12 +904,15 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
             mediaData['mimetype'] = mimeType
             mediaData['fileSha256'] = base64.b64encode(fileSha256).decode()
-            mediaData['fileLength'] = len(fileContent)
+            mediaData['fileLength'] = len(fileContent) if not message._attrs.get("fileLength") else message._attrs.get("fileLength")
             mediaData['mediaKey'] = base64.b64encode(encryptResult['mediaKey']).decode()
             mediaData['fileEncSha256'] = base64.b64encode(encryptResult['fileEncSha256']).decode()
             mediaData['mediaKeyTimestamp'] = encryptResult['mediaKeyTimestamp']
 
-            if mediaType == "image":
+            if mimeType == "image/webp":
+                yield maybeDeferred(self._addStickerInfo, message, fileContent, mediaData)
+
+            elif mediaType == "image":
                 yield maybeDeferred(self._addImageInfo, message, fileContent, mediaData)
 
             elif mediaType == "document":
@@ -678,15 +940,29 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             self.log.debug("Sending Media Using Cached Data {savedMedia}", savedMedia=savedMedia)
             mediaType = savedMedia['mediaType']
             mediaData = savedMedia['mediaData']
+            if message._attrs.get("fileLength"):
+                mediaData['fileLength'] = message._attrs.get("fileLength")
 
         message['mediaType'] = mediaType
 
         for k, v in mediaData.items():
             message[k] = v
+        return message
 
-        return (yield self._makeMessageNode(message, "media", mediaType))
+    @inlineCallbacks
+    def _processMediaMessage(self, message):
+        yield from self.generateMediaData(message)
+        return (yield self._makeMessageNode(message, "media", message["mediaType"]))
 
+    def _processContactMessage(self, message):
+        if message['vcard']:
+            return self._makeMessageNode(message, "text")
+        return fail(ValueError('vcard parameters required'))
 
+    def _processContactsArrayMessage(self, message):
+        if not message['contacts']:
+            return fail(ValueError('contacts parameters required'))
+        return self._makeMessageNode(message, "text")
     @inlineCallbacks
     def _addUploadInfo(self, uploadToken, body, mediaData):
         mediaConnInfo = yield self.request(Node(
@@ -724,12 +1000,19 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         mediaData['url'] = uploadResultDict['url']
         mediaData['directPath'] = uploadResultDict['direct_path']
 
+    def _opts(self, message, type):
+        if type == "thumbnail":
+            out = message.get("thumbnail")
+            if isinstance(out, bytes):
+                return out.decode()
+            else:
+                return out
 
     def _addImageInfo(self, message, imageBytes, mediaData):
         height, width, thumbnail = processImage(imageBytes, mediaData['mimetype'])
         mediaData['height'] = height
         mediaData['width'] = width
-        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode()
+        mediaData['jpegThumbnail'] = base64.b64encode(thumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
 
     def _addDocumentInfo(self, message, documentBytes, mediaData):
         pathSplit = os.path.splitext(message['url'])
@@ -757,9 +1040,9 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
         yield adapter.saveFrame(frameIO, int(duration // 2))
         _, _, jpegThumbnail = processImage(frameIO.getvalue(), "image/jpeg")
         frameIO.close()
-        mediaData['seconds'] = duration
-        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode()
-
+        mediaData['seconds'] = duration if not message._attrs.get("duration") else message._attrs.get("duration")
+        mediaData['jpegThumbnail'] = base64.b64encode(jpegThumbnail).decode() if not message._attrs.get("thumbnail") else self._opts(message._attrs, "thumbnail")
+ 
     @inlineCallbacks
     def _addAudioInfo(self, message, audioBytes, mediaData):
         if mediaData['mimetype'] == "application/ogg":
@@ -767,8 +1050,13 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
             mediaData['ptt'] = True
         adapter = FFMPEGVideoAdapter.fromBytes(audioBytes)
         yield adapter.ready()
+        os.remove(adapter.info['format']['filename'])
         duration = int(adapter.info['format']['duration'])
-        mediaData['seconds'] = duration
+        mediaData['ptt'] = mediaData.get("ptt", False) if not message._attrs.get("ptt") else message._attrs.get("ptt")
+        mediaData['seconds'] = duration if not message._attrs.get("duration") else message._attrs.get("duration")
+
+    def _addStickerInfo(self, message, stickerBytes, mediaData):
+        mediaData["isAnimated"] = message._attrs.get("isAnimated", False)
 
     def _usyncQuery(self, jids, context):
         if not jids:
