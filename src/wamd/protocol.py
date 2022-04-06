@@ -38,7 +38,12 @@ from axolotl.ecc import curve, djbec
 from axolotl.util.keyhelper import KeyHelper
 from axolotl.state.prekeybundle import PreKeyBundle
 from axolotl.identitykey import IdentityKey
-
+from typing import (
+    List,
+    Optional,
+    Union,
+    Literal
+)
 
 from .constants import Constants
 from .common import AuthState
@@ -639,6 +644,167 @@ class MultiDeviceWhatsAppClient(WebSocketClientProtocol):
 
     # sendMessage used by WebSocketClientProtocol
     relayMessage = sendMsg
+
+    @inlineCallbacks
+    def groupMetadata(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'get',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            },Node('query', {'request': 'interactive'}))))
+
+    @inlineCallbacks 
+    def getProfilePic(self, jid: str):
+        node = Node(
+                'iq', {
+                    'to':jid,
+                    'id': self._generateMessageId(),
+                    'type':'get',
+                    'xmlns': 'w:profile:picture'
+                }, Node(
+                    'picture',
+                    {
+                        'type': 'image',
+                        'query': 'url'
+                    })
+            )
+        respNode = yield self.request(node)
+        return (yield doHttpRequest(respNode.children[0]['url']))
+
+    @inlineCallbacks
+    def groupLeave(self, jid: str):
+        node = Node(
+                'iq',{
+                    'type': 'set',
+                    'id':self._generateMessageId(),
+                    'xmlns': 'w:g2',
+                    'to': '@g.us'
+
+                },
+                Node('leave', {}, Node('group', {'id': jid}))
+            )
+        return (yield self.request(node))
+
+    @inlineCallbacks
+    def groupUpdateSubject(self, jid: str, subject: str):
+        node = Node(
+                'iq', {
+                    'type': 'set',
+                    'id': self._generateMessageId(),
+                    'xmlns': 'w:g2',
+                    'to': jid
+                    },Node('subject', {}, subject.encode())
+                )
+        return (yield self.request(node))
+
+    @inlineCallbacks
+    def groupAcceptInvite(self, icode: str):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to':'@g.us'
+            },Node(
+                'invite',
+                {'code': icode}
+            )
+        ))).children[0]['jid']
+
+    @inlineCallbacks
+    def groupParticipantsUpdate(self, jid: str, participants: List[str], action: str):
+        """
+        :param action: "add"|"remove"|"promote"|"demote"
+        """
+        return (yield self.request(Node('iq',{
+            'type':'set',
+            'id':self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            },[Node(action, {}, [Node('participant', {'jid': i})]) for i in participants])))
+
+    @inlineCallbacks
+    def groupSettingUpdate(self, jid: str, setting: str):
+        """
+        :param setting: "announcement" | "not_announcement" | "locked" | "unlocked"
+        """
+        return (yield self.request(Node('iq',{
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node(setting)])))
+
+    @inlineCallbacks
+    def groupRevokeInvite(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node('invite')]))).children[0]['code']
+
+    @inlineCallbacks
+    def groupInviteCode(self, jid: str):
+        return (yield self.request(Node('iq', {
+            'type': 'get',
+            'id':self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to':jid
+            }, [Node('invite')]))).children[0]['code']
+
+    @inlineCallbacks
+    def groupUpdateDescription(self, jid: str, description:Optional[str] = None):
+        prev = (yield self.groupMetadata(jid)).children[0]['id']
+        return (yield self.request(Node(
+            'iq', {
+                'type':'set',
+                'id': self._generateMessageId(),
+                'xmlns': 'w:g2',
+                'to': jid
+                },
+            [Node('description', {
+                **({'id': self._generateMessageId()} if description else {'delete': True}), **({'prev': prev} if prev else {})},
+                Node('body', {}, description.encode() if description else None))]
+            )))
+
+    @inlineCallbacks
+    def groupEphemeral(self, jid: str, Expiration: int):
+        return (yield self.request(Node('iq', {
+            'type': 'set',
+            'id': self._generateMessageId(),
+            'xmlns': 'w:g2',
+            'to': jid
+            }, [Node(*['ephemeral' if Expiration else 'not_ephemeral', {'ephemeral': Expiration} if Expiration else {}])])))
+
+    @inlineCallbacks
+    def updateProfilePicture(self, jid: str, image: Union[str, bytes]):
+        if isinstance(image, str):
+            image = open(image, 'rb').read()
+        return (yield self.request(Node('iq',{
+            'type': 'set',
+            'to': jid,
+            'id': self._generateMessageId(),
+            'xmlns': 'w:profile:picture'
+        },[Node('picture', {'type': 'image'}, image)])))
+
+    @inlineCallbacks
+    def blockList(self):
+        return (yield self.request(Node('iq', {
+            'xmlns':'blocklist',
+            'id': self._generateMessageId(),
+            'to': Constants.S_WHATSAPP_NET,
+            'type': 'get'
+            })))
+
+    @inlineCallbacks
+    def updateBlockStatus(self, jid: str, action: Literal['unblock', 'block']):
+        return (yield self.request(Node('iq', {
+            'xmlns':'blocklist',
+            'id': self._generateMessageId(),
+            'to': Constants.S_WHATSAPP_NET,
+            'type': 'set'
+            },[Node('item', {'action': action, 'jid': jid})] )))
 
     def _processTextMessage(self, message):
         if not message['conversation']:
