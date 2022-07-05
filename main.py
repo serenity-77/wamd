@@ -17,8 +17,6 @@ from twisted.logger import (
     globalLogPublisher,
     Logger
 )
-
-from pipeline import save_update_key
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
 from wamd.common import AuthState
 from wamd.messages import TextMessage
@@ -78,7 +76,6 @@ def extraMessage(connection, message):
     json = message._attrs
     print(json)
     rabbit(json)
-    save_update_key(f"{json['messageTimestamp']}_{json['from'].split('@')[0]}", json)
     yield connection.sendReadReceipt(message)
 
 
