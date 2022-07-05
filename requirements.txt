@@ -9,3 +9,4 @@ protobuf
 python-magic
 pillow
 setuptools-rust
+pika

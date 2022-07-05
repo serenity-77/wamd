@@ -198,6 +198,7 @@ class MessageHandler(NodeHandler):
 
         try:
             message = WhatsAppMessage.fromWebMessageInfoProto(messageProto, isRead=isRead)
+            print(f'DEBUG Majid =>>>>>>>> {message}')
         except:
             self.log.failure("Failed to parse from protocol message")
         else:

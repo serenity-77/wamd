@@ -47,7 +47,7 @@ xargs rm -rf < install.txt
 ```
 
 Example:
-```shell
+```python
 import sys
 import json
 import pyqrcode

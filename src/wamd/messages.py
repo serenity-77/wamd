@@ -168,6 +168,7 @@ class WhatsAppMessage:
         })
 
         attributes.update(messageDict)
+        print(f'DEBUG message =>>>>>>>> {message}')
 
         if message is not None:
             if "conversation" in message:
@@ -185,7 +186,10 @@ class WhatsAppMessage:
         else:
             cls = ProtocolMessage
 
-        messageObj = cls(**attributes)
+        try:
+            messageObj = cls(**attributes)
+        except:
+            pass
 
         if message is not None:
             messageObj.populateFromMessage(message)
