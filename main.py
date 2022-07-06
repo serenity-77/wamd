@@ -20,11 +20,12 @@ from twisted.logger import (
 from wamd.protocol import connectToWhatsAppServer, MultiDeviceWhatsAppClient
 from wamd.common import AuthState
 from wamd.messages import TextMessage
+from config import Config
 
 globalLogPublisher.addObserver(
     FilteringLogObserver(
         observer=textFileLogObserver(sys.stdout, timeFormat="%Y-%M-%d %H:%M:%S"),
-        predicates=[LogLevelFilterPredicate(defaultLogLevel=LogLevel.levelWithName("debug"))]  # or info
+        predicates=[LogLevelFilterPredicate(defaultLogLevel=LogLevel.levelWithName(Config.DEBUG))]  # or info
     )
 )
 
@@ -32,11 +33,11 @@ log = Logger()
 
 
 def rabbit(msg):
-    credentials = pika.PlainCredentials('meh', '123456hP')
+    credentials = pika.PlainCredentials(Config.USER_RABBIT, Config.PASS_RABBIT)
     connection = pika.BlockingConnection(
-        pika.ConnectionParameters('broker-rabbit.kavosh.org', 5672, 'meh', credentials))
+        pika.ConnectionParameters(Config.URL_RABBIT, 5672, Config.VIRTUAL_HOST_RABBIT, credentials))
     channel = connection.channel()
-    channel.basic_publish(exchange='', routing_key='ir-wa-posts', body=json.dumps(msg))
+    channel.basic_publish(exchange='', routing_key=Config.ROUTING_KEY_RABBIT, body=json.dumps(msg))
     print(" [x] Sent {}".format(msg))
     connection.close()
 
