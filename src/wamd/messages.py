@@ -46,6 +46,9 @@ class WhatsAppMessage:
         for k, v in kwargs.items():
             self._attrs[k] = v
 
+    def __contains__(self, item):
+        return item in self._attrs
+
     def __getitem__(self, item):
         try:
             return self._attrs[item]
